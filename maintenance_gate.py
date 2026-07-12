@@ -2,7 +2,10 @@
 
 Token refresh and model probes both open outbound HTTP and rewrite shared
 state. On a large multi-account pool they must not run at the same time or the
-single Uvicorn worker + disk become unresponsive.
+Uvicorn worker + disk become unresponsive.
+
+When REDIS_URL is configured, the slot is a Redis lock shared by all
+processes; otherwise a process-local threading.Lock is used (single-worker).
 """
 
 from __future__ import annotations
@@ -17,6 +20,15 @@ from config import MAINTENANCE_LOCK_TIMEOUT
 _lock = threading.Lock()
 _holder: str | None = None
 _held_since = 0.0
+
+
+def _redis_mode() -> bool:
+    try:
+        from store.redis_client import redis_enabled
+
+        return redis_enabled()
+    except Exception:
+        return False
 
 
 @contextmanager
@@ -34,6 +46,26 @@ def maintenance_slot(
     """
     global _holder, _held_since
     wait = MAINTENANCE_LOCK_TIMEOUT if timeout is None else max(0.0, float(timeout))
+
+    if _redis_mode():
+        try:
+            from store.locks_redis import redis_maintenance_slot
+
+            with redis_maintenance_slot(owner, timeout=wait, blocking=blocking) as ok:
+                if ok:
+                    _holder = owner
+                    _held_since = time.time()
+                try:
+                    yield ok
+                finally:
+                    if ok:
+                        _holder = None
+                        _held_since = 0.0
+            return
+        except Exception:
+            # Fall through to local lock if Redis path fails mid-flight.
+            pass
+
     acquired = _lock.acquire(blocking=blocking, timeout=wait if blocking else -1)
     if not acquired:
         yield False
@@ -49,10 +81,21 @@ def maintenance_slot(
 
 
 def status() -> dict[str, float | str | bool | None]:
-    held = _lock.locked()
+    backend = "redis" if _redis_mode() else "local"
+    extra: dict = {}
+    if backend == "redis":
+        try:
+            from store.locks_redis import redis_lock_status
+
+            extra = redis_lock_status()
+        except Exception as e:  # noqa: BLE001
+            extra = {"error": str(e)}
+    held = _lock.locked() if backend == "local" else bool(extra.get("busy"))
+    holder = _holder if held else (extra.get("holder") if backend == "redis" else None)
     return {
-        "busy": held,
-        "holder": _holder if held else None,
+        "busy": held or bool(extra.get("busy")),
+        "holder": holder if (held or extra.get("busy")) else None,
         "held_for_sec": (time.time() - _held_since) if held and _held_since else 0.0,
         "timeout_sec": MAINTENANCE_LOCK_TIMEOUT,
+        "backend": backend,
     }

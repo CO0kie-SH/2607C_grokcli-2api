@@ -1,0 +1,3668 @@
+/* multi-page admin core — clean rebuild v2 */
+window.G2A = window.G2A || {};
+(function () {
+  "use strict";
+  const $ = (id) => (window.G2A && G2A.$ ? G2A.$(id) : document.getElementById(id));
+  const toast = (...a) => (window.G2A && G2A.toast ? G2A.toast(...a) : console.log(...a));
+  const esc = (s) => (window.G2A && G2A.esc ? G2A.esc(s) : String(s ?? ""));
+  const copyText = (...a) => (window.G2A && G2A.copyText ? G2A.copyText(...a) : Promise.resolve(false));
+  const fmtTime = (...a) => (window.G2A && G2A.fmtTime ? G2A.fmtTime(...a) : String(a[0] ?? "—"));
+  const fmtExpiry = (...a) => (window.G2A && G2A.fmtExpiry ? G2A.fmtExpiry(...a) : fmtTime(a[0]));
+  const fmtRemaining = (...a) => (window.G2A && G2A.fmtRemaining ? G2A.fmtRemaining(...a) : "—");
+  const remainingClass = (...a) => (window.G2A && G2A.remainingClass ? G2A.remainingClass(...a) : "");
+  const currentOrigin = () => (window.G2A && G2A.currentOrigin ? G2A.currentOrigin() : (location.origin || ""));
+  const currentAdminUrl = () => (window.G2A && G2A.currentAdminUrl ? G2A.currentAdminUrl() : ((location.origin || "") + "/admin"));
+  const TOKEN_KEY = (window.G2A && G2A.TOKEN_KEY) || "g2a_admin_token";
+  let token = (window.G2A && G2A.getToken) ? G2A.getToken() : (localStorage.getItem(TOKEN_KEY) || "");
+  let statusCache = null;
+  let dashCache = null;
+  let loginSessionId = null;
+  let devicePollTimer = null;
+  let regSessionId = null;
+  let regSessionIds = [];
+  let regBatchId = null;
+  let regPollTimer = null;
+  let regFinishedNotified = false;
+  let regProbedIds = new Set();
+  let regProbeRunning = false;
+  let keysCache = [];
+  let quotaCache = {};
+  let uiRefreshTimer = null;
+  let accountsList = [];
+  let accountsPage = 1;
+  let accountsTotal = 0;
+  let accountsTotalPages = 1;
+  let accountsLoading = false;
+  let accountsLoadSeq = 0;
+  let accountsPageSize = 25;
+  let accountsSearchQuery = "";
+  let selectedAccountIds = new Set();
+  function syncToken() { token = (window.G2A && G2A.getToken) ? G2A.getToken() : token; }
+  function headers(json = true) {
+    syncToken();
+    const h = {};
+    if (json) h["Content-Type"] = "application/json";
+    if (token) h["X-Admin-Token"] = token;
+    return h;
+  }
+  async function api(path, opts = {}) {
+    syncToken();
+    if (window.G2A && G2A.api) {
+      try { return await G2A.api(path, opts); }
+      catch (e) { if (e && e.status === 401) token = ""; throw e; }
+    }
+    const res = await fetch("/admin/api" + path, {
+      ...opts,
+      credentials: "same-origin",
+      headers: { ...headers(!(opts.body instanceof FormData) && opts.method !== "GET"), ...(opts.headers || {}) },
+    });
+    let data = null;
+    try { data = await res.json(); } catch { data = null; }
+    if (!res.ok) {
+      const msg = (data && (data.detail || data.error || data.message)) || res.statusText;
+      const err = new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+      err.status = res.status;
+      throw err;
+    }
+    return data;
+  }
+  function on(id, ev, fn) {
+    const el = $(id);
+    if (!el) return false;
+    try {
+      // Prefer property handlers for easy rebind after soft-nav content swaps.
+      el[ev] = fn;
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+function setLogPanel(id, text, { forceShow = false } = {}) {
+  const el = $(id);
+  if (!el) return;
+  const val = (text == null ? "" : String(text)).trim();
+  const empty = !val || val === "—" || val === "-" || val === "暂无" || val === "idle";
+  if (empty && !forceShow) {
+    el.textContent = "—";
+    el.classList.add("is-empty", "hidden");
+    el.hidden = true;
+    return;
+  }
+  el.textContent = val || "—";
+  el.classList.remove("is-empty", "hidden");
+  el.hidden = false;
+}
+
+function showPanel(id) {
+  const el = $(id);
+  if (!el) return;
+  el.classList.remove("hidden");
+  el.hidden = false;
+}
+
+function hidePanel(id) {
+  const el = $(id);
+  if (!el) return;
+  el.classList.add("hidden");
+  el.hidden = true;
+}
+
+
+  // Event delegation for dynamic content (works after soft-nav HTML swaps).
+  function delegate(rootId, eventName, selector, handler) {
+    const root = $(rootId) || document;
+    const key = `_g2a_deleg_${eventName}_${selector}`;
+    if (root[key]) return;
+    root[key] = true;
+    root.addEventListener(eventName, (e) => {
+      const t = e.target && e.target.closest ? e.target.closest(selector) : null;
+      if (!t || (root !== document && !root.contains(t))) return;
+      handler(e, t);
+    });
+  }
+
+
+function renderStoreConn(hostId) {
+  // Overview no longer displays auth / DB / Redis connection diagnostics.
+  // Keep a no-op so older call sites remain safe.
+  const host = $(hostId);
+  if (host) {
+    host.innerHTML = "";
+    host.hidden = true;
+    host.classList.add("hidden");
+  }
+}
+
+const PAGE_META = {
+  overview: { title: "概览", sub: "服务状态、账号池与 Token 健康度一览" },
+  keys: { title: "API Keys", sub: "创建、复制、停用客户端访问密钥" },
+  accounts: { title: "账号 / 轮询", sub: "Grok 账号、设备码登录、额度与导入导出" },
+  logs: { title: "日志", sub: "查询系统与管理台日志（登录、账号、Key、探测、冷却、设置等）" },
+  models: { title: "模型", sub: "上游模型缓存与探测结果" },
+  settings: { title: "系统设置", sub: "修改管理员密码、轮询策略与 sub2api / 维护参数" },
+  guide: { title: "接入指南", sub: "OpenAI / Anthropic 客户端配置示例" },
+};
+
+function showAuth(setup) {
+  $("boot-view")?.classList.add("hidden");
+  $("auth-view")?.classList.remove("hidden");
+  $("main-view")?.classList.add("hidden");
+  if ($("auth-title")) $("auth-title").textContent = setup ? "初始化管理密码" : "登录管理台";
+  if ($("auth-desc")) $("auth-desc").textContent = setup
+    ? "首次使用，请设置管理员密码（至少 4 位）"
+    : "使用管理员密码进入";
+  if ($("auth-submit")) $("auth-submit").textContent = setup ? "创建并进入" : "进入";
+}
+function showMain() {
+  $("boot-view")?.classList.add("hidden");
+  $("auth-view")?.classList.add("hidden");
+  $("main-view")?.classList.remove("hidden");
+  startAutoUiRefresh();
+}
+
+const PAGE_HREF = { overview: "/admin", keys: "/admin/keys", accounts: "/admin/accounts", logs: "/admin/logs", models: "/admin/models", settings: "/admin/settings", guide: "/admin/guide" };
+let _softNavToken = 0;
+let _softNavBusy = false;
+let _softNavBusySince = 0;
+
+function pageFromPath(pathname) {
+  const p = (pathname || location.pathname || "").replace(/\/$/, "") || "/admin";
+  if (p.endsWith("/keys")) return "keys";
+  if (p.endsWith("/accounts")) return "accounts";
+  if (p.endsWith("/logs")) return "logs";
+  if (p.endsWith("/models")) return "models";
+  if (p.endsWith("/settings")) return "settings";
+  if (p.endsWith("/guide")) return "guide";
+  if (p.endsWith("/login")) return "login";
+  return "overview";
+}
+
+function setActiveMenu(page) {
+  document.querySelectorAll(".g2a-menu-item[data-page]").forEach((a) => {
+    a.classList.toggle("is-active", a.getAttribute("data-page") === page);
+  });
+  document.querySelectorAll("#mobile-nav a").forEach((a) => {
+    const href = (a.getAttribute("href") || "").replace(/\/$/, "");
+    const map = PAGE_HREF;
+    const activeHref = (map[page] || "/admin").replace(/\/$/, "");
+    a.classList.toggle("active", href === activeHref);
+    a.classList.toggle("is-active", href === activeHref);
+  });
+}
+
+function applyPageMeta(page) {
+  const meta = PAGE_META[page] || PAGE_META.overview;
+  if ($("page-title")) $("page-title").textContent = meta.title;
+  if ($("page-sub")) $("page-sub").textContent = meta.sub;
+  document.title = meta.title + " · grokcli-2api";
+  document.body.dataset.page = page;
+  setActiveMenu(page);
+}
+
+async function softNavigate(name, opts) {
+  opts = opts || {};
+  const page = name || "overview";
+  const href = PAGE_HREF[page] || "/admin";
+  const cur = (location.pathname || "").replace(/\/$/, "") || "/admin";
+  const target = href.replace(/\/$/, "") || "/admin";
+  if (cur === target && !opts.force) {
+    applyPageMeta(page);
+    return true;
+  }
+  // Keep shell painted. NEVER full-document navigate for admin pages (that causes black flash).
+  if (_softNavBusy) {
+    // A previous nav is stuck/in-flight: don't queue forever; unlock stale locks.
+    if (_softNavBusySince && (Date.now() - _softNavBusySince) > 8000) {
+      try { clearSoftNavBusy("stale"); } catch (_) {}
+    } else {
+      return false;
+    }
+  }
+  _softNavBusy = true;
+  _softNavBusySince = Date.now();
+  const my = ++_softNavToken;
+  document.body.classList.add("is-authed");
+  document.body.classList.add("g2a-softnav-busy");
+  // Theme-aware paint lock (avoid forcing pure black in light mode).
+  try {
+    const theme = document.documentElement.getAttribute("data-theme") || "dark";
+    document.documentElement.style.background = theme === "light" ? "#f5f7fb" : "#0a0a0f";
+  } catch (_) {
+    document.documentElement.style.background = "#0a0a0f";
+  }
+  // Hard timeout: never leave the UI dimmed/black if fetch hangs.
+  const busyTimer = setTimeout(() => {
+    if (my === _softNavToken) {
+      try { clearSoftNavBusy("timeout"); } catch (_) {}
+      try { toast("页面切换超时，已恢复界面", false); } catch (_) {}
+    }
+  }, 10000);
+  try {
+    const res = await fetch(href, {
+      credentials: "same-origin",
+      headers: { "X-Requested-With": "G2ASoftNav", "Accept": "text/html" },
+      cache: "no-store",
+    });
+    if (!res.ok) throw new Error("页面加载失败 " + res.status);
+    const html = await res.text();
+    if (my !== _softNavToken) return false;
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    const nextContent = doc.querySelector(".g2a-content");
+    const curContent = document.querySelector(".g2a-content");
+    if (!nextContent || !curContent) throw new Error("页面结构异常");
+
+    // Swap only page body content; sidebar/header stay mounted.
+    if (typeof curContent.replaceChildren === "function") {
+      const frag = document.createDocumentFragment();
+      Array.from(nextContent.childNodes).forEach((n) => frag.appendChild(document.importNode(n, true)));
+      curContent.replaceChildren(frag);
+    } else {
+      curContent.innerHTML = nextContent.innerHTML;
+    }
+
+    const nt = doc.querySelector("#page-title");
+    const ns = doc.querySelector("#page-sub");
+    if (nt && $("page-title")) $("page-title").textContent = nt.textContent;
+    if (ns && $("page-sub")) $("page-sub").textContent = ns.textContent;
+    applyPageMeta(page);
+    if (!opts.replace) history.pushState({ g2aPage: page }, "", href);
+    else history.replaceState({ g2aPage: page }, "", href);
+
+    try {
+      if (typeof rebindPageControls === "function") rebindPageControls();
+      try { if (window.G2A && G2A.bindThemeToggle) G2A.bindThemeToggle(document); } catch(_){}
+      // Non-blocking data load so menu clicks feel instant.
+      if (typeof loadDashboard === "function") {
+        Promise.resolve(loadDashboard()).catch((e) => console.warn("soft nav loadDashboard", e));
+      }
+    } catch (e) {
+      console.warn("soft nav loadDashboard", e);
+    }
+    if (page === "overview") {
+      try { startAutoUiRefresh(); } catch (_) {}
+    } else {
+      try { if (uiRefreshTimer) { clearInterval(uiRefreshTimer); uiRefreshTimer = null; } } catch (_) {}
+    }
+    if (page === "settings") {
+      try { await loadSystemSettings(); } catch (e) { console.warn("loadSystemSettings", e); }
+    }
+    if (page === "accounts") {
+      try { await loadRegConfig(false); } catch (e) { console.warn("loadRegConfig", e); }
+    }
+    // Page-specific renders after content swap
+    try {
+      if (page === "accounts" && typeof renderAccounts === "function") renderAccounts();
+      if (page === "keys" && typeof renderKeys === "function") renderKeys();
+      if (page === "logs" && typeof loadAdminLogs === "function") loadAdminLogs({ reset: false });
+      if (page === "models" && typeof renderModels === "function") renderModels();
+      if (page === "guide" && typeof renderGuide === "function") renderGuide();
+      if (page === "overview" && typeof renderStats === "function") renderStats();
+    } catch (e) {
+      console.warn("soft nav render", e);
+    }
+    return true;
+  } catch (e) {
+    console.error("softNavigate failed", e);
+    try { toast((e && e.message) || "切换页面失败", false); } catch (_) {}
+    // Do NOT full-page navigate (black flash). Recover in place; offer one soft reload of content.
+    try { applyPageMeta(pageFromPath(location.pathname)); } catch (_) {}
+    try { clearSoftNavBusy("error"); } catch (_) {}
+    // Do not full-reload on soft-nav failure (causes "界面卡死/反复刷新" on flaky networks).
+    // Stay on current shell; user can click menu again or use refresh button.
+    return false;
+  } finally {
+    try { clearTimeout(busyTimer); } catch (_) {}
+    if (my === _softNavToken) {
+      clearSoftNavBusy("done");
+    }
+  }
+}
+
+function clearSoftNavBusy(reason) {
+  _softNavBusy = false;
+  _softNavBusySince = 0;
+  try { document.body.classList.remove("g2a-softnav-busy"); } catch (_) {}
+  // keep is-authed; only busy dimmer is harmful
+}
+
+function hideEmptyLogPanels() {
+  try { if (!loginSessionId) setDeviceLoginIdle(true); } catch (_) {}
+  ["device-log", "reg-log", "probe-result", "sso-result"].forEach((id) => {
+    const el = $(id);
+    if (!el) return;
+    const val = (el.textContent || "").trim();
+    if (!val || val === "—" || val === "-") {
+      el.classList.add("is-empty", "hidden");
+      el.hidden = true;
+    }
+  });
+  const regBox = $("reg-session-box");
+  if (regBox) {
+    const st = ((regBox.querySelector("#reg-status") && regBox.querySelector("#reg-status").textContent) || "").trim() || "idle";
+    const log = $("reg-log");
+    const logText = ((log && log.textContent) || "").trim();
+    const emptyLog = !log || log.classList.contains("hidden") || !logText || logText === "—";
+    if ((st === "idle" || st === "—" || st === "") && emptyLog) {
+      regBox.classList.add("hidden");
+      regBox.hidden = true;
+    }
+  }
+}
+
+function rebindPageControls() {
+  try { bindLogsControls(); } catch (_) {}
+  try { hideEmptyLogPanels(); } catch (_) {}
+
+  // Re-bind controls after soft navigation content swaps. Idempotent.
+  try { if (window.G2A && G2A.bindThemeToggle) G2A.bindThemeToggle(document); } catch (_) {}
+
+  // Header / global
+  on("btn-refresh", "onclick", async () => {
+    try {
+      _statusFetchedAt = 0;
+      statusCache = null;
+      await loadDashboard();
+      toast("已刷新");
+    } catch (e) { toast(e.message, false); }
+  });
+  on("btn-logout", "onclick", async () => {
+    try { await api("/logout", { method: "POST", body: "{}" }); } catch (_) {}
+    try { if (window.G2A && G2A.clearToken) G2A.clearToken(); else localStorage.removeItem(TOKEN_KEY); } catch (_) {}
+    document.body.classList.remove("is-authed");
+    location.replace("/admin/login");
+  });
+  on("btn-refresh-all", "onclick", async () => {
+    try {
+      _statusFetchedAt = 0;
+      statusCache = null;
+      await loadDashboard();
+      toast("已刷新");
+    } catch (e) { toast(e.message, false); }
+  });
+
+  // Overview
+  const bindQuota = (id) => { const el = $(id); if (el) el.onclick = () => refreshAllQuota(true); };
+  const bindProbe = (id) => { const el = $(id); if (el) el.onclick = () => runProbeAll(); };
+  bindQuota("btn-refresh-quota");
+  bindQuota("btn-refresh-quota-2");
+  bindProbe("btn-probe-all");
+  bindProbe("btn-probe-all-2");
+  if ($("chk-token-maintain")) $("chk-token-maintain").onchange = () => setFeatureToggle("/settings/token-maintain", !!$("chk-token-maintain").checked, "Token 自动续期");
+  if ($("chk-model-health")) $("chk-model-health").onchange = () => setFeatureToggle("/settings/model-health", !!$("chk-model-health").checked, "自动健康探测");
+  on("btn-refresh-tokens", "onclick", async () => {
+    try {
+      if ($("btn-refresh-tokens")) $("btn-refresh-tokens").disabled = true;
+      const r = await api("/accounts/refresh", { method: "POST", body: JSON.stringify({ force: true }) });
+      const n = r.refreshed ?? ((r.refresh && r.refresh.refreshed) != null ? r.refresh.refreshed : null) ?? (r.results || []).filter(x => x.ok && !x.skipped).length;
+      toast(`Token 已刷新：${n ?? 0} 个账号`);
+      // Merge immediate refresh result into caches so overview text updates now.
+      statusCache = statusCache || {};
+      dashCache = dashCache || {};
+      const tm = Object.assign({}, statusCache.token_maintainer || {}, r.maintainer || r.token_maintainer || {});
+      tm.last = Object.assign({}, tm.last || {}, {
+        ok: true,
+        at: Date.now() / 1000,
+        force: true,
+        refresh: r.refresh || {
+          refreshed: n ?? 0,
+          attempted: r.attempted ?? ((r.results || []).length || n || 0),
+          failed: r.failed,
+          skipped: r.skipped,
+        },
+      });
+      statusCache.token_maintainer = tm;
+      dashCache.token_maintainer = tm;
+      try { renderMaintainer(); } catch (_) {}
+      try { await refreshOverviewStatus({ force: true, render: true }); } catch (_) { await loadDashboard(); }
+    } catch (e) { toast(e.message, false); }
+    finally { if ($("btn-refresh-tokens")) $("btn-refresh-tokens").disabled = false; }
+  });
+  on("btn-normalize-keys", "onclick", async () => {
+    try {
+      const r = await api("/accounts/normalize", { method: "POST" });
+      toast(`多账号键规范化：变更 ${r.changed ?? 0}，共 ${r.total ?? 0} 个`);
+      _statusFetchedAt = 0;
+      await loadDashboard();
+    } catch (e) { toast(e.message, false); }
+  });
+
+  // Keys
+  on("btn-create-key", "onclick", async () => {
+    try {
+      const name = ($("key-name") && $("key-name").value) || "default";
+      const note = ($("key-note") && $("key-note").value) || "";
+      const data = await api("/keys", { method: "POST", body: JSON.stringify({ name, note }) });
+      const rec = data.key || data;
+      const full = (rec && (rec.key || rec.secret)) || data.secret || "";
+      const box = $("new-key-box");
+      if (box) {
+        box.classList.remove("hidden");
+        box.innerHTML = `<div style="font-weight:600;margin-bottom:6px;color:var(--ok)">✓ Key 已创建 — 列表中可随时再复制</div>
+          <div class="mono" id="new-key-value" style="user-select:all;word-break:break-all;cursor:pointer" title="点击复制">${esc(full)}</div>
+          <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+            <button class="g2a-btn g2a-btn-primary g2a-btn-sm" id="copy-key">复制 Key</button>
+            <button class="g2a-btn g2a-btn-default g2a-btn-sm" id="dismiss-key">收起</button>
+          </div>`;
+        const doCopy = async () => {
+          if (!full) { toast("Key 为空", false); return; }
+          const ok = await copyText(full);
+          toast(ok ? "已复制 API Key" : "复制失败，请手动选中复制", ok);
+        };
+        on("copy-key", "onclick", doCopy);
+        on("new-key-value", "onclick", doCopy);
+        on("dismiss-key", "onclick", () => box.classList.add("hidden"));
+      }
+      if (full) {
+        const ok = await copyText(full);
+        if (ok) toast("已创建并自动复制到剪贴板");
+      }
+      if ($("key-name")) $("key-name").value = "";
+      if ($("key-note")) $("key-note").value = "";
+      await loadDashboard();
+    } catch (e) { toast(e.message, false); }
+  });
+
+  // Models / accounts common
+  on("btn-sync-models", "onclick", async () => {
+    try {
+      const r = await api("/models/sync", { method: "POST" });
+      toast(`已同步 ${r.count || 0} 个模型`);
+      await loadDashboard();
+    } catch (e) { toast(e.message, false); }
+  });
+  on("btn-save-mode", "onclick", async () => {
+    try {
+      const mode = $("account-mode") ? $("account-mode").value : "";
+      await api("/settings/account-mode", { method: "PUT", body: JSON.stringify({ mode }) });
+      toast("轮询策略已保存: " + mode);
+      await loadDashboard();
+    } catch (e) { toast(e.message, false); }
+  });
+
+  // System settings page
+  on("btn-reload-settings", "onclick", async () => {
+    try {
+      await loadSystemSettings(true);
+      toast("已重新加载设置");
+    } catch (e) { toast(e.message || "加载失败", false); }
+  });
+  on("btn-save-settings", "onclick", async () => {
+    try { await saveSystemSettings(); } catch (e) { toast(e.message || "保存失败", false); }
+  });
+  on("btn-change-password", "onclick", async () => {
+    try { await changeAdminPassword(); } catch (e) { toast(e.message || "修改失败", false); }
+  });
+  on("btn-refresh-acc", "onclick", async () => {
+    try {
+      _statusFetchedAt = 0;
+      await loadDashboard();
+      toast("已刷新");
+    } catch (e) { toast(e.message, false); }
+  });
+
+  // Accounts toolbar
+  if ($("btn-acc-search")) $("btn-acc-search").onclick = () => applyAccountSearch(true);
+  if ($("btn-acc-search-clear")) $("btn-acc-search-clear").onclick = () => {
+    if ($("acc-search")) $("acc-search").value = "";
+    applyAccountSearch(true);
+  };
+  if ($("acc-search")) {
+    $("acc-search").onkeydown = (e) => { if (e.key === "Enter") applyAccountSearch(true); };
+  }
+  if ($("btn-acc-select-page")) $("btn-acc-select-page").onclick = () => setPageSelection(true);
+  if ($("btn-acc-select-all-filtered")) $("btn-acc-select-all-filtered").onclick = () => { setPageSelection(true); toast("已选择本页账号（服务端分页）"); };
+  if ($("btn-acc-select-none")) $("btn-acc-select-none").onclick = () => { selectedAccountIds.clear(); renderAccountsPage(); };
+  if ($("btn-acc-delete-selected")) $("btn-acc-delete-selected").onclick = () => deleteSelectedAccounts();
+  if ($("btn-acc-renew-selected")) $("btn-acc-renew-selected").onclick = () => renewAccounts(Array.from(selectedAccountIds));
+  if ($("btn-acc-probe-selected")) $("btn-acc-probe-selected").onclick = () => probeAccounts(Array.from(selectedAccountIds));
+  if ($("btn-acc-export-selected")) $("btn-acc-export-selected").onclick = () => exportSelectedAccounts();
+  on("acc-page-prev", "onclick", () => { if (accountsPage > 1 && !accountsLoading) { accountsPage--; loadAccountsPage(); } });
+  on("acc-page-next", "onclick", () => { if (!accountsLoading && accountsPage < (accountsTotalPages || 1)) { accountsPage++; loadAccountsPage(); } });
+  on("acc-page-size", "onchange", () => {
+    accountsPageSize = parseInt(($("acc-page-size") && $("acc-page-size").value) || "25", 10) || 25;
+    accountsPage = 1;
+    loadAccountsPage({ reset: true });
+  });
+
+  // Device login / import / export / reg
+  // Always re-enable progressive device UI on each rebind.
+  if (!loginSessionId) setDeviceLoginIdle(true);
+  else setDeviceLoginIdle(false);
+  on("btn-login-device", "onclick", () => startDeviceLogin());
+  on("btn-poll-device", "onclick", () => pollDeviceSession());
+  on("btn-copy-device", "onclick", () => copyDeviceCode());
+  on("btn-import", "onclick", () => importJsonFiles());
+  on("btn-import-sso", "onclick", () => importSsoCookies());
+  if ($("btn-export")) on("btn-export", "onclick", async () => {
+    try {
+      const res = await fetch("/admin/api/accounts/export?download=1", { credentials: "same-origin", headers: headers(false) });
+      if (!res.ok) throw new Error(res.statusText);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = "grok2api-auth-export.json";
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+      toast("已导出 auth.json");
+    } catch (e) { toast(e.message, false); }
+  });
+  on("btn-logout-cli", "onclick", async () => {
+    if (!confirm("注销全部 Grok 账号？（将清空数据库账号池与本地镜像）")) return;
+    try {
+      const r = await api("/accounts/logout", { method: "POST" });
+      toast(r.message || "完成", !!r.ok);
+      await loadDashboard();
+    } catch (e) { toast(e.message, false); }
+  });
+  if ($("btn-start-reg")) on("btn-start-reg", "onclick", async () => {
+    try {
+      const config = readRegConfig();
+      cacheRegConfigLocal(config);
+      $("btn-start-reg").disabled = true;
+      const r = await api("/accounts/register-email", { method: "POST", body: JSON.stringify(buildRegBody(config)) });
+      regFinishedNotified = false;
+      regProbedIds = new Set();
+      regProbeRunning = false;
+      regBatchId = r.batch_id || null;
+      regSessionId = r.id || r.session_id || (Array.isArray(r.session_ids) ? r.session_ids[0] : null);
+      regSessionIds = Array.isArray(r.session_ids) ? r.session_ids.slice() : (regSessionId ? [regSessionId] : []);
+      const startedCount = Number(r.count || regSessionIds.length || 1) || 1;
+      const workers = Number(r.concurrency || config.concurrency || 1) || 1;
+      showPanel("reg-session-box");
+      if (Array.isArray(r.sessions) && r.sessions.length) showRegSessionGroup(r.sessions, { batch: r });
+      else if (regSessionId) showRegSession(r);
+      else {
+        if ($("reg-status")) $("reg-status").textContent = "starting";
+        if ($("reg-email")) $("reg-email").textContent = regBatchId ? `batch ${regBatchId}` : "—";
+        setLogPanel(
+          "reg-log",
+          [
+            `[start] 多线程协议注册已启动`,
+            `目标数量: ${startedCount}`,
+            `并发: ${workers}`,
+            `batch_id: ${regBatchId || "—"}`,
+            `session_ids: ${(regSessionIds || []).join(", ") || "等待 spawner…"}`,
+            `message: ${r.message || "ok"}`,
+          ].join("\n"),
+          { forceShow: true }
+        );
+      }
+      toast(r.message || `已启动注册 ×${startedCount}（并发 ${workers}）`);
+      // Start path auto-saves on server; refresh form from DB shortly after
+      setTimeout(() => { loadRegConfig(true).catch(() => {}); }, 300);
+      clearInterval(regPollTimer);
+      regPollTimer = setInterval(pollRegSession, 2000);
+      setTimeout(pollRegSession, 600);
+    } catch (e) { toast(e.message, false); }
+    finally { if ($("btn-start-reg")) $("btn-start-reg").disabled = false; }
+  });
+  if ($("btn-save-reg")) on("btn-save-reg", "onclick", () => { saveRegConfig().catch(() => {}); });
+  if ($("btn-refresh-reg")) on("btn-refresh-reg", "onclick", () => pollRegSession());
+  if ($("btn-test-reg-proxy")) on("btn-test-reg-proxy", "onclick", async () => {
+    try {
+      $("btn-test-reg-proxy").disabled = true;
+      const r = await api("/register-email/test-proxy", { method: "POST", body: JSON.stringify(buildProxyTestBody(readRegConfig())) });
+      showPanel("reg-session-box");
+      if ($("reg-email")) $("reg-email").textContent = "xAI 代理测试";
+      if ($("reg-status")) $("reg-status").textContent = r.ok ? "代理可用" : "代理不可用";
+      setLogPanel("reg-log", JSON.stringify(r, null, 2), { forceShow: true });
+      toast(r.ok ? "代理测试通过" : "代理测试失败", !!r.ok);
+    } catch (e) { toast(e.message, false); }
+    finally { if ($("btn-test-reg-proxy")) $("btn-test-reg-proxy").disabled = false; }
+  });
+
+  // Delegated table actions (survive soft-nav swaps)
+  if ($("keys-tbody") && !$("keys-tbody")._g2aBound) {
+    $("keys-tbody")._g2aBound = true;
+    $("keys-tbody").addEventListener("click", async (e) => {
+      const btn = e.target.closest("button");
+      if (!btn) return;
+      const id = btn.dataset.id;
+      try {
+        if (btn.dataset.act === "copy") {
+          const k = keysCache[id] || {};
+          let full = k.secret || k.key || "";
+          let regenerated = false;
+          if (!full) {
+            if (!confirm("该 Key 未保存完整值，无法直接复制。是否重新生成？旧 Key 会立即。")) return;
+            const data = await api("/keys/" + id + "/regenerate", { method: "POST" });
+            const rec = data.key || data;
+            full = (rec && (rec.key || rec.secret)) || data.secret || "";
+            if (!full) { toast("重建后仍无完整值", false); await loadDashboard(); return; }
+            keysCache[id] = rec; regenerated = true;
+          }
+          const ok = await copyText(full);
+          toast(ok ? (regenerated ? "已重建并复制 API Key" : "已复制 API Key") : "复制失败", ok);
+          if (regenerated) await loadDashboard();
+          return;
+        }
+        if (btn.dataset.act === "del") {
+          if (!confirm("确定删除此 Key？")) return;
+          await api("/keys/" + id, { method: "DELETE" });
+          toast("已删除");
+        } else if (btn.dataset.act === "toggle") {
+          await api("/keys/" + id, { method: "PATCH", body: JSON.stringify({ enabled: btn.dataset.on === "1" }) });
+          toast("已更新");
+        }
+        await loadDashboard();
+      } catch (err) { toast(err.message, false); }
+    });
+  }
+
+  if ($("accounts-tbody") && !$("accounts-tbody")._g2aBound) {
+    $("accounts-tbody")._g2aBound = true;
+    $("accounts-tbody").addEventListener("click", async (e) => {
+      const chk = e.target.closest(".acc-check-one");
+      if (chk) {
+        const id = chk.dataset.id;
+        if (!id) return;
+        if (chk.checked) selectedAccountIds.add(id); else selectedAccountIds.delete(id);
+        updateAccountSelectionInfo(accountsTotal || 0, document.querySelectorAll(".acc-check-one").length);
+        return;
+      }
+      const btn = e.target.closest("button");
+      if (!btn) return;
+      const id = btn.dataset.id;
+      try {
+        if (btn.dataset.act === "renew-one") { await renewAccounts([id], { confirmMany: false }); return; }
+        if (btn.dataset.act === "probe-one") { await runAccountProbe(id); return; }
+        if (btn.dataset.act === "quota-one") {
+          setRowBusy(id, true, "查询中");
+          try {
+            const q = await api("/accounts/" + encodeURIComponent(id) + "/quota");
+            quotaCache[id] = q;
+            if (q.auto_disabled) toast("该账号额度已耗尽，已移出轮询", false);
+            else if (q.ok) toast((q.display && q.display.summary) || "额度已更新");
+            else toast(q.error || "额度查询失败", false);
+            upsertAccountInList({
+              id,
+              _pool: {
+                last_quota: q,
+                disabled_for_quota: !!q.auto_disabled || !!q.exhausted,
+                disabled_reason: q.auto_disabled ? (q.error || "额度耗尽") : undefined,
+              },
+            });
+            refreshOneAccountLocal(id);
+          } finally {
+            setRowBusy(id, false);
+          }
+          return;
+        }
+        if (btn.dataset.act === "toggle-acc") {
+          setRowBusy(id, true, "处理中");
+          try {
+            const en = btn.dataset.on === "1";
+            await api("/accounts/" + encodeURIComponent(id) + "/enabled", { method: "PATCH", body: JSON.stringify({ enabled: en }) });
+            toast(en ? "已启用" : "已禁用");
+            upsertAccountInList({ id, _pool: { enabled: en, disabled_for_quota: en ? false : undefined, consecutive_fails: en ? 0 : undefined, in_cooldown: en ? false : undefined } });
+            refreshOneAccountLocal(id);
+          } finally {
+            setRowBusy(id, false);
+          }
+          return;
+        }
+        if (btn.dataset.act === "rm-acc") {
+          if (!confirm("确定移除此账号？将从数据库与本地镜像同步删除。")) return;
+          setRowBusy(id, true, "移除中");
+          try {
+            await api("/accounts/" + encodeURIComponent(id), { method: "DELETE" });
+            selectedAccountIds.delete(id);
+            accountsList = (accountsList || []).filter((a) => a.id !== id);
+            accountsTotal = Math.max(0, (accountsTotal || 1) - 1);
+            const row = document.querySelector(`tr[data-acc-id="${CSS.escape(String(id))}"]`);
+            if (row) row.remove();
+            if ($("acc-page-info")) {
+              $("acc-page-info").textContent = `${accountsPage} / ${Math.max(1, accountsTotalPages || 1)} (本页 ${document.querySelectorAll("#accounts-tbody tr[data-acc-id]").length} / 共 ${accountsTotal || 0} 个)`;
+            }
+            toast("已移除");
+          } finally {
+            setRowBusy(id, false);
+          }
+          return;
+        }
+      } catch (err) { toast(err.message, false); }
+    });
+  }
+}
+
+function switchTab(name) {
+  softNavigate(name);
+}
+
+function buildMobileNav() {
+  const host = $("mobile-nav");
+  if (!host) return;
+  const map = { overview: "/admin", keys: "/admin/keys", accounts: "/admin/accounts", models: "/admin/models", settings: "/admin/settings", guide: "/admin/guide" };
+  const active = document.body.dataset.page || "overview";
+  host.innerHTML = Object.keys(PAGE_META).map(k => `<a class="${k===active?"active is-active":""}" href="${map[k]}">${PAGE_META[k].title}</a>`).join("");
+}
+
+
+
+async function bootstrap() {
+  if (window.__g2aBootstrapped) return;
+  window.__g2aBootstrapped = true;
+  if (location.protocol === "file:") { toast("请通过服务打开管理台", false); location.replace("/admin/login"); return; }
+  // Never blank the page on navigation. Keep shell visible the whole time.
+  syncToken();
+  document.body.classList.add("is-authed");
+  document.documentElement.classList.add("g2a-has-session");
+  try { if (window.G2A && G2A.bindThemeToggle) G2A.bindThemeToggle(document); } catch(_){}
+  try {
+    buildMobileNav();
+    const page = document.body.dataset.page || pageFromPath(location.pathname) || "overview";
+    applyPageMeta(page);
+
+    // Soft session restore: validate local token OR cookie session.
+    // Never keep a stale local token that makes the UI look "logged in" while APIs 401.
+    try {
+      await api("/session");
+      if (window.G2A && G2A.markAuthOk) G2A.markAuthOk();
+    } catch (_) {
+      try { if (window.G2A && G2A.clearToken) G2A.clearToken(); else { token=""; localStorage.removeItem(TOKEN_KEY); } } catch (_) {}
+      document.body.classList.remove("is-authed");
+      document.documentElement.classList.remove("g2a-has-session");
+      location.replace("/admin/login?next=" + encodeURIComponent(location.pathname + location.search));
+      return;
+    }
+
+    try {
+      statusCache = await api("/status");
+      if (statusCache && statusCache.setup_needed) {
+        token = "";
+        try { if (window.G2A && G2A.clearToken) G2A.clearToken(); else localStorage.removeItem(TOKEN_KEY); } catch (_) {}
+        document.body.classList.remove("is-authed");
+        document.documentElement.classList.remove("g2a-has-session");
+        location.replace("/admin/login");
+        return;
+      }
+    } catch (e) {
+      console.warn("status failed", e);
+      toast("无法连接服务: " + (e.message || e), false);
+    }
+
+    try {
+      await loadDashboard();
+      if (page === "settings") {
+        try { await loadSystemSettings(); } catch (es) { console.warn("settings load", es); }
+      }
+    } catch (e1) {
+      console.error(e1);
+      if (e1 && e1.status === 401 && !(e1.soft || (window.G2A && G2A.inAuthGrace && G2A.inAuthGrace()))) {
+        try { if (window.G2A && G2A.clearToken) G2A.clearToken(); } catch (_) {}
+        document.body.classList.remove("is-authed");
+        location.replace("/admin/login?next=" + encodeURIComponent(location.pathname + location.search));
+        toast("会话已失效，请重新登录", false);
+        return;
+      }
+      toast(e1.message || "加载失败", false);
+      if (page === "accounts") renderAccounts();
+      if (page === "keys") renderKeys();
+      if (page === "models") { try { renderModels(); } catch (_) {} }
+      if (page === "guide") { try { renderGuide(); } catch (_) {} }
+      if (page === "overview") { try { renderStats(); } catch (_) {} }
+    }
+    try { rebindPageControls(); } catch(_){}
+    if (page === "overview") startAutoUiRefresh();
+    if (page === "accounts") renderAccounts();
+    if (page === "keys") renderKeys();
+    on("btn-logout", "onclick", async () => {
+      try { await api("/logout", { method: "POST", body: "{}" }); } catch (_) {}
+      try { if (window.G2A && G2A.clearToken) G2A.clearToken(); else localStorage.removeItem(TOKEN_KEY); } catch (_) {}
+      document.body.classList.remove("is-authed");
+      location.replace("/admin/login");
+    });
+    on("btn-refresh", "onclick", async () => {
+      try {
+        _statusFetchedAt = 0;
+        statusCache = null;
+        await loadDashboard();
+        toast("已刷新");
+      } catch (e) { toast(e.message, false); }
+    });
+  } catch (e) {
+    if (e && e.status === 401) {
+      try { if (window.G2A && G2A.clearToken) G2A.clearToken(); } catch (_) {}
+      document.body.classList.remove("is-authed");
+      location.replace("/admin/login");
+      toast("会话已失效，请重新登录", false);
+    } else {
+      toast((e && e.message) || "错误", false);
+    }
+  }
+}
+
+let _statusFetchedAt = 0;
+
+async function refreshOverviewStatus({ force = true, render = true } = {}) {
+  // Force-refresh /status and re-render overview widgets so button actions update text immediately.
+  try {
+    if (force) _statusFetchedAt = 0;
+    const st = await api("/status");
+    statusCache = st || statusCache;
+    _statusFetchedAt = Date.now();
+    if (window.G2A && G2A.state) G2A.state.status = statusCache;
+    // Keep dashCache in sync for fields overview prefers from either source.
+    if (statusCache) {
+      dashCache = dashCache || {};
+      if (statusCache.token_maintainer) dashCache.token_maintainer = statusCache.token_maintainer;
+      if (statusCache.model_health) dashCache.model_health = statusCache.model_health;
+      if (statusCache.pool) dashCache.pool = Object.assign({}, dashCache.pool || {}, statusCache.pool);
+      if (statusCache.settings) dashCache.settings = Object.assign({}, dashCache.settings || {}, statusCache.settings);
+      if (statusCache.accounts) dashCache.accounts = Object.assign({}, dashCache.accounts || {}, statusCache.accounts);
+    }
+  } catch (e) {
+    if (e && e.status === 401 && !e.soft) throw e;
+    console.warn("refreshOverviewStatus", e);
+  }
+  if (render) {
+    try { renderStats(); } catch (_) {}
+    try { renderMaintainer(); } catch (_) {}
+    try { renderModelHealthInfo(); } catch (_) {}
+    try { renderStoreConn("overview-conn"); } catch (_) {}
+  }
+  return statusCache;
+}
+
+async function loadDashboard() {
+  const page = document.body.dataset.page || pageFromPath(location.pathname) || "overview";
+  // Always refresh lightweight status. Full /dashboard is large with 500+ accounts
+  // and only needed by overview widgets — skip it on keys/accounts/models/guide.
+  try {
+    const now = Date.now();
+    if (!statusCache || (now - _statusFetchedAt) > 5000) {
+      statusCache = await api("/status");
+      _statusFetchedAt = now;
+      if (window.G2A && G2A.state) G2A.state.status = statusCache;
+      // Keep dash fields aligned so overview text switches immediately.
+      if (statusCache) {
+        dashCache = dashCache || {};
+        if (statusCache.token_maintainer) dashCache.token_maintainer = statusCache.token_maintainer;
+        if (statusCache.model_health) dashCache.model_health = statusCache.model_health;
+        if (statusCache.pool) dashCache.pool = Object.assign({}, dashCache.pool || {}, statusCache.pool);
+        if (statusCache.settings) dashCache.settings = Object.assign({}, dashCache.settings || {}, statusCache.settings);
+      }
+    }
+  } catch (e) {
+    if (e && e.status === 401) throw e;
+    console.warn("status failed", e);
+  }
+
+  if (page === "overview") {
+    // Paint from /status immediately. /dashboard is optional enrichment only.
+    try { renderStats(); } catch (e) { console.error(e); }
+    try { renderMaintainer(); } catch (e) { console.error(e); }
+    try { renderModelHealthInfo(); } catch (e) { console.error(e); }
+    try { renderStoreConn("overview-conn"); } catch (e) {}
+    try {
+      const dash = await api("/dashboard");
+      dashCache = dash;
+      if (window.G2A && G2A.state) G2A.state.dashboard = dashCache;
+      try { renderStats(); } catch (e) { console.error(e); }
+      try { renderMaintainer(); } catch (e) { console.error(e); }
+      try { renderModelHealthInfo(); } catch (e) { console.error(e); }
+      try { renderStoreConn("overview-conn"); } catch (e) {}
+    } catch (e) {
+      // Network blips / busy workers should not break overview.
+      console.warn("dashboard failed", e);
+      if (e && e.status === 401 && !e.soft) throw e;
+      // Keep last dashCache if any; stats already rendered from status.
+    }
+  } else if (page === "keys") {
+    await Promise.resolve(renderKeys());
+  } else if (page === "accounts") {
+    await Promise.resolve(renderAccounts());
+  } else if (page === "logs") {
+    try { await loadAdminLogs({ reset: false }); } catch (e) { console.warn(e); }
+  } else if (page === "models") {
+    try { renderModels(); } catch (e) {}
+    try { renderModelHealthInfo(); } catch (e) {}
+  } else if (page === "guide") {
+    try { renderGuide(); } catch (e) {}
+  }
+
+  try {
+    const st = statusCache || {};
+    const ver = st.version || (dashCache && dashCache.version) || "";
+    if ($("app-version") && ver) $("app-version").textContent = "v" + ver;
+    const pill = $("status-pill");
+    if (pill) {
+      const mode = st.account_mode || (dashCache && dashCache.account_mode) || "";
+      const live = (st.accounts && st.accounts.active_count) ?? (st.pool && st.pool.live) ?? (dashCache && dashCache.pool && dashCache.pool.live);
+      const email = st.credentials_email || "";
+      pill.className = "g2a-tag" + (st.credentials_ok ? " ok" : "");
+      pill.textContent = [email, mode, live != null ? ("账号 " + live) : ""].filter(Boolean).join(" · ") || "—";
+    }
+  } catch (_) {}
+}
+
+function renderStats() {
+  const s = statusCache || {};
+  const d = dashCache || {};
+  const pool = d.pool || s.pool || {};
+  const credOk = !(d.credentials && d.credentials.error) && (s.credentials_ok || (pool.live > 0));
+  const pill = $("status-pill");
+  if (credOk) {
+    pill.className = "g2a-tag ok";
+    pill.textContent = "● 已登录 " + (s.credentials_email || "") + " · " + (d.account_mode || s.account_mode || "");
+  } else {
+    pill.className = "g2a-tag bad";
+    pill.textContent = "● 未登录 / 凭证异常";
+  }
+  const keys = d.keys || s.keys || {};
+  const acc = d.accounts || s.accounts || {};
+  const tm = d.token_maintainer || s.token_maintainer || {};
+  const lastTm = tm.last || {};
+  const rem = (tm.min_remaining_sec != null ? tm.min_remaining_sec : lastTm.min_remaining_sec);
+  const nextWait = (tm.next_wait_sec != null ? tm.next_wait_sec : (lastTm.next_wait_sec != null ? lastTm.next_wait_sec : tm.interval_sec));
+  const remLabel = (rem == null || rem === "")
+    ? "—"
+    : (Number(rem) < 0 ? ("已过期") : fmtRemaining(Date.now() / 1000 + Number(rem)));
+  const lastRef = (lastTm.refresh && lastTm.refresh.refreshed != null) ? lastTm.refresh.refreshed : null;
+  $("stats-grid").innerHTML = `
+    <div class="stat"><div class="label">API Base</div><div class="value mono">${esc(d.api_base || s.api_base || "")}</div></div>
+    <div class="stat"><div class="label">CLI 版本</div><div class="value mono">${esc(d.cli_version || s.cli_version || "")}</div>
+      <div class="sub">上游 ${esc(d.upstream || s.upstream || "")}</div></div>
+    <div class="stat"><div class="label">账号池</div><div class="value">${pool.enabled ?? acc.active_count ?? 0} 启用 / ${pool.live ?? acc.active_count ?? 0} 有效</div>
+      <div class="sub">模式 ${esc(d.account_mode || s.account_mode || "—")} · 冷却 ${pool.in_cooldown ?? 0} · 额度禁用 ${pool.quota_disabled ?? 0}</div></div>
+    <div class="stat"><div class="label">API Keys</div><div class="value">${keys.enabled ?? 0} 启用 / ${keys.total ?? 0}</div>
+      <div class="sub">请求累计 ${keys.total_requests ?? 0} · 鉴权 ${keys.auth_required ? "开启" : "关闭"}</div></div>
+    <div class="stat"><div class="label">Token 自动续期</div><div class="value">${(tm.running || tm.cluster_running || tm.leader_running) ? "运行中" : (tm.enabled === false ? "已关闭" : (tm.enabled ? "已启用" : "未运行"))}</div>
+      <div class="sub">最短剩余 ${esc(remLabel)} · 下次 ${nextWait ?? "—"}s${lastRef != null ? ` · 上次刷新 ${lastRef}` : ""}${lastTm.at ? ` · ${fmtTime(lastTm.at)}` : ""}</div></div>
+  `;
+}
+
+function renderMaintainer() {
+  const d = dashCache || {};
+  const s = statusCache || {};
+  const tm = d.token_maintainer || s.token_maintainer || {};
+  const settings = d.settings || s.settings || {};
+  const enabled = tm.enabled !== false && settings.token_maintain_enabled !== false;
+  const pill = $("maintainer-pill");
+  const info = $("maintainer-info");
+  const chk = $("chk-token-maintain");
+  if (chk && document.activeElement !== chk) chk.checked = !!enabled;
+  if (!pill || !info) return;
+  if (!enabled) {
+    pill.className = "g2a-tag warn";
+    pill.textContent = "● 已关闭";
+  } else if (tm.running || tm.cluster_running || tm.leader_running) {
+    pill.className = "g2a-tag ok";
+    pill.textContent = "● 自动续期运行中";
+  } else if (tm.enabled) {
+    // multi-worker: this response may come from a non-leader process
+    pill.className = "g2a-tag ok";
+    pill.textContent = "● 已启用（后台）";
+  } else {
+    pill.className = "g2a-tag bad";
+    pill.textContent = "● 未运行";
+  }
+  const last = tm.last || {};
+  const refresh = (last && last.refresh) || {};
+  const refreshed = refresh.refreshed;
+  const attempted = refresh.attempted;
+  const deleted = refresh.deleted ?? refresh.invalidated;
+  const rem = (tm.min_remaining_sec != null ? tm.min_remaining_sec : last.min_remaining_sec);
+  const nextWait = (tm.next_wait_sec != null ? tm.next_wait_sec : (last.next_wait_sec != null ? last.next_wait_sec : tm.interval_sec));
+  const remTxt = (rem == null || rem === "")
+    ? "—"
+    : (Number(rem) < 0 ? ("已过期 " + fmtRemaining(Date.now() / 1000 + Number(rem)).replace(/^-/, "")) : fmtRemaining(Date.now() / 1000 + Number(rem)));
+  const lastRefreshTxt = (refreshed == null && attempted == null)
+    ? "上次刷新 —"
+    : `上次刷新 ${refreshed ?? 0} 个` + (attempted != null ? ` / 尝试 ${attempted}` : "") + (deleted ? ` · 删除 ${deleted}` : "");
+  info.textContent = [
+    enabled ? "开关: 开" : "开关: 关",
+    `最短剩余: ${remTxt}`,
+    enabled ? `下次检查约 ${nextWait ?? "—"}s` : "后台任务已暂停",
+    lastRefreshTxt,
+    last.at ? `于 ${fmtTime(last.at)}` : null,
+  ].filter(Boolean).join(" · ");
+}
+
+function renderKeys() {
+  const tbody = $("keys-tbody");
+  if (tbody) tbody.innerHTML = `<tr><td colspan="6" class="g2a-muted">加载 API Keys…</td></tr>`;
+  return api("/keys").then((data) => {
+    const body = $("keys-tbody");
+    if (!body) return;
+    const keys = data.keys || [];
+    const src = data.store_source || data.store_backend || "";
+    window.__g2aKeysStore = { source: src };
+    if ($("page-sub") && document.body && document.body.dataset.page === "keys") {
+      $("page-sub").textContent = src === "postgres"
+        ? "创建、复制、停用客户端访问密钥 · 数据源：数据库"
+        : "创建、复制、停用客户端访问密钥";
+    }
+    keysCache = {};
+    keys.forEach((k) => { keysCache[k.id] = k; });
+    if (!keys.length) {
+      body.innerHTML = `<tr><td colspan="6" class="g2a-muted">暂无 Key。创建后客户端访问 /v1 将需要鉴权。</td></tr>`;
+      return;
+    }
+    body.innerHTML = keys.map((k) => {
+      const canCopy = !!(k.secret || k.key);
+      return `
+      <tr>
+        <td>${esc(k.name)}<div class="g2a-muted" style="font-size:0.75rem">${esc(k.note || "")}</div></td>
+        <td class="mono" title="${canCopy ? "点击复制完整 Key" : "缺少完整 Key，需重新生成"}">${esc(k.prefix)}…</td>
+        <td>${k.enabled ? '<span class="g2a-tag ok">启用</span>' : '<span class="g2a-tag bad">停用</span>'}</td>
+        <td>${k.request_count || 0}</td>
+        <td class="g2a-muted">${fmtTime(k.created_at)}</td>
+        <td class="g2a-actions">
+          <button class="g2a-btn g2a-btn-primary g2a-btn-sm" data-act="copy" data-id="${esc(k.id)}">${canCopy ? "复制" : "重建复制"}</button>
+          <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="toggle" data-id="${esc(k.id)}" data-on="${k.enabled ? 0 : 1}">${k.enabled ? "停用" : "启用"}</button>
+          <button class="g2a-btn g2a-btn-danger g2a-btn-sm" data-act="del" data-id="${esc(k.id)}">删除</button>
+        </td>
+      </tr>`;
+    }).join("");
+  }).catch((e) => {
+    const body = $("keys-tbody");
+    if (body) body.innerHTML = `<tr><td colspan="6" class="g2a-muted">加载失败：${esc(e.message || e)}</td></tr>`;
+    toast(e.message || "加载 Keys 失败", false);
+  });
+}
+
+function fmtQuotaCell(p, liveQuota) {
+  const q = liveQuota || p.last_quota || null;
+  const poolDisabled = p.enabled === false || p.disabled_for_quota || !!(liveQuota && liveQuota.pool_disabled);
+  if (!q) {
+    return `<span class="g2a-muted">未查询</span>
+      <div style="margin-top:4px"><button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="quota-one" data-id="${esc(p.id || "")}">查询</button></div>`;
+  }
+  if (q.error && !q.summary) {
+    return `<span class="g2a-tag bad">查询失败</span><div class="g2a-muted" style="font-size:0.72rem;margin-top:4px">${esc(q.error)}</div>`;
+  }
+  const exhausted = q.exhausted || p.disabled_for_quota;
+  const summary = (q.display && q.display.summary) || q.summary || "—";
+  let pill;
+  if (exhausted) pill = '<span class="g2a-tag bad">额度耗尽</span>';
+  else if (poolDisabled) pill = '<span class="g2a-tag warn">禁用·不计入汇总</span>';
+  else if (q.unlimited_or_free) pill = '<span class="g2a-tag ok">免费/促销</span>';
+  else pill = '<span class="g2a-tag ok">有额度</span>';
+  const detail = exhausted && p.disabled_reason
+    ? `<div class="g2a-muted" style="font-size:0.72rem;margin-top:4px">${esc(p.disabled_reason)}</div>`
+    : `<div class="g2a-muted" style="font-size:0.72rem;margin-top:4px">${esc(summary)}</div>`;
+  return `${pill}${detail}`;
+}
+
+
+function getFilteredAccounts() {
+  // Server-side filtering/pagination: accountsList holds current page rows.
+  return accountsList.slice();
+}
+
+
+function updateAccountSelectionInfo(filteredCount, pageCount) {
+  const el = $("acc-selection-info");
+  if (!el) return;
+  const selected = selectedAccountIds.size;
+  const q = (accountsSearchQuery || "").trim();
+  const total = accountsTotal || accountsList.length;
+  el.textContent = q
+    ? `已选 ${selected} 个 · 匹配 ${total} · 本页 ${pageCount}`
+    : `已选 ${selected} 个 · 全部 ${total} · 本页 ${pageCount}`;
+  const pageCheck = $("acc-check-page");
+  if (pageCheck) {
+    const pageIds = Array.from(document.querySelectorAll(".acc-check-one")).map(x => x.dataset.id);
+    const selectedOnPage = pageIds.filter(id => selectedAccountIds.has(id)).length;
+    pageCheck.checked = pageIds.length > 0 && selectedOnPage === pageIds.length;
+    pageCheck.indeterminate = selectedOnPage > 0 && selectedOnPage < pageIds.length;
+  }
+}
+
+function renderAccountsPage() {
+  const pageItems = accountsList.slice();
+  const totalPages = Math.max(1, accountsTotalPages || 1);
+  accountsPage = Math.max(1, Math.min(accountsPage || 1, totalPages));
+  const __empty = $("accounts-empty");
+  if (__empty) {
+    const hide = (accountsTotal || accountsList.length) > 0;
+    __empty.classList.toggle("hidden", hide);
+    __empty.style.display = hide ? "none" : "block";
+  }
+  const tbody = $("accounts-tbody");
+  if (!tbody) return;
+  if (accountsLoading && !pageItems.length) {
+    tbody.innerHTML = `<tr><td colspan="9" class="g2a-muted">加载账号中…</td></tr>`;
+  } else {
+    tbody.innerHTML = pageItems.map((a) => {
+      const p = a._pool || { id: a.id };
+      const enabled = p.enabled !== false;
+      const stackLen = Array.isArray(p.status_stack) ? p.status_stack.length : 0;
+      const cdCount = Number(p.cooldown_count || stackLen || 0) || 0;
+      const cooling = !!(p.in_cooldown || cdCount > 0 || stackLen > 0 || p.pool_status === "cooldown");
+      const quotaOff = p.disabled_for_quota;
+      const streak = Number(p.consecutive_fails || 0) || 0;
+      const cdCode = p.cooldown_code || "";
+      const cdModel = p.cooldown_model || "";
+      const cdTok = (p.cooldown_tokens_actual != null && p.cooldown_tokens_limit != null)
+        ? `${p.cooldown_tokens_actual}/${p.cooldown_tokens_limit}` : "";
+      let poolLabel;
+      if (quotaOff) poolLabel = '<span class="g2a-tag bad">额度禁用</span>';
+      else if (!enabled) poolLabel = '<span class="g2a-tag bad">已禁用</span>';
+      else if (cooling) {
+        const n = cdCount > 0 ? cdCount : 1;
+        const tip = [
+          "冷却中",
+          n > 1 ? `叠加×${n}` : "",
+          cdCode ? `code=${cdCode}` : "",
+          cdModel ? `model=${cdModel}` : "",
+          cdTok ? `tokens ${cdTok}` : "",
+          "单次测活成功即恢复正常",
+        ].filter(Boolean).join(" · ");
+        poolLabel = `<span class="g2a-tag warn" title="${esc(tip)}">冷却中</span>`;
+      }
+      else if (streak >= 2) poolLabel = `<span class="g2a-tag warn">轮询中 · 连败${streak}</span>`;
+      else poolLabel = '<span class="g2a-tag ok">轮询中</span>';
+      const usage = `${p.success_count || 0}√ / ${p.fail_count || 0}× · 共 ${p.request_count || 0}`;
+      const refreshPill = a.has_refresh_token
+        ? '<span class="g2a-tag ok" title="可自动 refresh">可自动续期</span>'
+        : '<span class="g2a-tag warn">无 refresh</span>';
+      const liveQ = quotaCache[a.id];
+      const probeCell = fmtProbeCell(p.last_probe, p.last_error, p.blocked_model_ids);
+      const checked = selectedAccountIds.has(a.id) ? "checked" : "";
+      const expiryCell = fmtExpiry(a.expires_at);
+      return `
+    <tr data-acc-id="${esc(a.id)}">
+      <td><input type="checkbox" class="acc-check-one" data-id="${esc(a.id)}" ${checked} /></td>
+      <td>${esc(a.email || "—")}<div class="muted mono" style="font-size:0.72rem">${esc(a.id)}</div></td>
+      <td>${a.expired ? '<span class="g2a-tag bad">已过期</span>' : '<span class="g2a-tag ok">有效</span>'}</td>
+      <td>${poolLabel}</td>
+      <td class="g2a-muted" style="font-size:0.8rem">${usage}</td>
+      <td style="font-size:0.82rem;min-width:140px">${fmtQuotaCell({ ...p, id: a.id }, liveQ)}</td>
+      <td style="font-size:0.78rem;min-width:160px">${probeCell}</td>
+      <td style="font-size:0.8rem;min-width:150px">
+        ${expiryCell}
+        <div style="margin-top:6px">${refreshPill}</div>
+      </td>
+      <td class="g2a-actions">
+        <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="renew-one" data-id="${esc(a.id)}" ${a.has_refresh_token ? "" : "disabled title=\"无 refresh_token，无法续期\""}>续期</button>
+        <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="probe-one" data-id="${esc(a.id)}">模型测试</button>
+        <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="quota-one" data-id="${esc(a.id)}">额度</button>
+        <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="toggle-acc" data-id="${esc(a.id)}" data-on="${enabled ? 0 : 1}">${enabled ? "禁用" : "启用"}</button>
+        <button class="g2a-btn g2a-btn-danger g2a-btn-sm" data-act="rm-acc" data-id="${esc(a.id)}">移除</button>
+      </td>
+    </tr>`;
+    }).join("") || `<tr><td colspan="9" class="g2a-muted">${(accountsTotal || 0) ? "无匹配账号" : "无账号"}</td></tr>`;
+  }
+  if ($("acc-page-info")) {
+    const src = (window.__g2aAccountsStore && window.__g2aAccountsStore.source) || "";
+    const srcTxt = src === "postgres" ? " · 数据库" : (src ? ` · ${src}` : "");
+    $("acc-page-info").textContent = `${accountsPage} / ${totalPages} (本页 ${pageItems.length} / 共 ${accountsTotal || 0} 个${srcTxt})`;
+  }
+  if ($("acc-page-prev")) $("acc-page-prev").disabled = accountsPage <= 1 || accountsLoading;
+  if ($("acc-page-next")) $("acc-page-next").disabled = accountsPage >= totalPages || accountsLoading;
+  updateAccountSelectionInfo(accountsTotal || 0, pageItems.length);
+}
+
+function renderAccounts() {
+  return loadAccountsPage({ reset: false });
+}
+
+let _quotaCacheHydrated = false;
+async function hydrateQuotaCacheFromDB() {
+  // Page rows already embed last_quota from DB — just project them into quotaCache.
+  // Do NOT call /accounts/quota?cached=1 (that scans the whole pool and freezes UI).
+  try {
+    let changed = false;
+    (accountsList || []).forEach((a) => {
+      const lq = a && a._pool && a._pool.last_quota;
+      if (a && a.id && lq && typeof lq === "object") {
+        const prev = quotaCache[a.id];
+        quotaCache[a.id] = { ...lq, account_id: a.id, cached: true };
+        if (!prev) changed = true;
+      }
+    });
+    _quotaCacheHydrated = true;
+    if (changed) {
+      try { renderAccountsPage(); } catch (_) {}
+    }
+  } catch (_) {
+    // ignore
+  }
+}
+
+async function loadAccountsPage({ reset = false } = {}) {
+  const tbody = $("accounts-tbody");
+  if (reset) accountsPage = 1;
+  if (tbody) tbody.innerHTML = `<tr><td colspan="9" class="g2a-muted">加载账号中…</td></tr>`;
+  accountsLoading = true;
+  const seq = ++accountsLoadSeq;
+  const q = (accountsSearchQuery || ($("acc-search") && $("acc-search").value) || "").trim();
+  accountsSearchQuery = q;
+  const pageSize = accountsPageSize || 25;
+  const page = accountsPage || 1;
+  try {
+    const data = await api(`/accounts?page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}&q=${encodeURIComponent(q)}`);
+    if (seq !== accountsLoadSeq) return;
+    const rawAccounts = Array.isArray(data && data.accounts) ? data.accounts : [];
+    accountsList = rawAccounts.map((a) => ({ ...a, _pool: a._pool || { id: a.id } }));
+    // hydrate quota cache from DB-backed last_quota so UI shows cached status immediately
+    accountsList.forEach((a) => {
+      const lq = a && a._pool && a._pool.last_quota;
+      if (a && a.id && lq && typeof lq === "object") {
+        quotaCache[a.id] = { ...lq, account_id: a.id, cached: true };
+      }
+    });
+    accountsTotal = Number(data.total != null ? data.total : (data.account_count || accountsList.length)) || 0;
+    accountsTotalPages = Number(data.total_pages || Math.max(1, Math.ceil((accountsTotal || 0) / pageSize))) || 1;
+    accountsPage = Number(data.page || page) || 1;
+    accountsPageSize = Number(data.page_size || pageSize) || pageSize;
+    if (data.pool && statusCache) statusCache.pool = Object.assign({}, statusCache.pool || {}, data.pool);
+    // Remember durable store source so UI can show "数据库" instead of auth.json.
+    window.__g2aAccountsStore = {
+      source: data.store_source || data.store_backend || "file",
+      auth_file_role: data.auth_file_role || (data.store_source === "postgres" ? "mirror" : "primary"),
+    };
+    if ($("page-sub") && document.body && document.body.dataset.page === "accounts") {
+      const src = window.__g2aAccountsStore.source;
+      $("page-sub").textContent = src === "postgres"
+        ? "Grok 账号、设备码登录、额度与导入导出 · 数据源：数据库"
+        : "Grok 账号、设备码登录、额度与导入导出";
+    }
+    console.info(
+      "[accounts] page", accountsPage, "/", accountsTotalPages,
+      "rows", accountsList.length, "total", accountsTotal,
+      "store", window.__g2aAccountsStore.source
+    );
+    accountsLoading = false;
+    renderAccountsPage();
+    hydrateQuotaCacheFromDB();
+  } catch (e) {
+    if (seq !== accountsLoadSeq) return;
+    accountsLoading = false;
+    console.error("[accounts] load failed", e);
+    toast(e.message || "加载账号失败", false);
+    if (tbody) tbody.innerHTML = `<tr><td colspan="9" class="g2a-muted">加载失败：${esc(e.message || e)}</td></tr>`;
+  }
+}
+
+
+function applyAccountSearch(resetPage = true) {
+  accountsSearchQuery = $("acc-search") ? $("acc-search").value.trim() : "";
+  if (resetPage) accountsPage = 1;
+  loadAccountsPage({ reset: !!resetPage });
+}
+
+
+function setPageSelection(checked) {
+  document.querySelectorAll(".acc-check-one").forEach(el => {
+    const id = el.dataset.id;
+    if (!id) return;
+    el.checked = !!checked;
+    if (checked) selectedAccountIds.add(id);
+    else selectedAccountIds.delete(id);
+  });
+  updateAccountSelectionInfo(getFilteredAccounts().length, document.querySelectorAll(".acc-check-one").length);
+}
+
+function setFilteredSelection(checked) {
+  const list = getFilteredAccounts();
+  list.forEach(a => {
+    if (!a.id) return;
+    if (checked) selectedAccountIds.add(a.id);
+    else selectedAccountIds.delete(a.id);
+  });
+  renderAccountsPage();
+}
+
+async function deleteSelectedAccounts() {
+  const ids = Array.from(selectedAccountIds);
+  if (!ids.length) {
+    toast("请先勾选要删除的账号", false);
+    return;
+  }
+  if (!confirm(`确定删除选中的 ${ids.length} 个账号？将从数据库与本地镜像同步删除。`)) return;
+  try {
+    const r = await api("/accounts/delete-batch", {
+      method: "POST",
+      body: JSON.stringify({ ids }),
+    });
+    selectedAccountIds.clear();
+    toast(`已删除 ${r.removed_count || 0} 个` + (r.missing_count ? `，未找到 ${r.missing_count}` : ""));
+    statusCache = await api("/status");
+    await loadDashboard();
+  } catch (e) {
+    toast(e.message, false);
+  }
+}
+
+
+function upsertAccountInList(partial) {
+  if (!partial || !partial.id) return null;
+  const id = partial.id;
+  let updated = null;
+  let found = false;
+  accountsList = (accountsList || []).map((a) => {
+    if (a.id !== id) return a;
+    found = true;
+    const next = { ...a, ...partial };
+    if (partial._pool || a._pool) {
+      next._pool = { ...(a._pool || { id }), ...(partial._pool || {}) };
+    }
+    // keep expired flag coherent when expires_at changes
+    if (partial.expires_at != null) {
+      const exp = Number(partial.expires_at);
+      if (Number.isFinite(exp)) next.expired = exp > 0 && exp * (exp > 1e12 ? 1 : 1000) <= Date.now();
+      // if seconds
+      if (Number.isFinite(exp) && exp < 1e12) next.expired = exp * 1000 <= Date.now();
+    }
+    updated = next;
+    return next;
+  });
+  if (!found) {
+    updated = { id, _pool: { id }, ...partial, _pool: { id, ...(partial._pool || {}) } };
+    accountsList = [updated, ...(accountsList || [])];
+  }
+  return updated;
+}
+
+function renderOneAccountRow(account) {
+  if (!account || !account.id) return "";
+  const a = account;
+  const p = a._pool || { id: a.id };
+  const enabled = p.enabled !== false;
+  const stackLen = Array.isArray(p.status_stack) ? p.status_stack.length : 0;
+  const cdCount = Number(p.cooldown_count || stackLen || 0) || 0;
+  const cooling = !!(p.in_cooldown || cdCount > 0 || stackLen > 0 || p.pool_status === "cooldown");
+  const quotaOff = p.disabled_for_quota;
+  let poolLabel;
+  if (quotaOff) poolLabel = '<span class="g2a-tag bad">额度禁用</span>';
+  else if (!enabled) poolLabel = '<span class="g2a-tag bad">已禁用</span>';
+  else if (cooling) {
+    const n = cdCount > 0 ? cdCount : 1;
+    const tip = n > 1 ? `冷却中 · 叠加×${n} · 单次测活成功即恢复` : "冷却中 · 单次测活成功即恢复";
+    poolLabel = `<span class="g2a-tag warn" title="${esc(tip)}">冷却中</span>`;
+  }
+  else poolLabel = '<span class="g2a-tag ok">轮询中</span>';
+  const usage = `${p.success_count || 0}√ / ${p.fail_count || 0}× · 共 ${p.request_count || 0}`;
+  const refreshPill = a.has_refresh_token
+    ? '<span class="g2a-tag ok" title="可自动 refresh">可自动续期</span>'
+    : '<span class="g2a-tag warn">无 refresh</span>';
+  const liveQ = quotaCache[a.id];
+  const probeCell = fmtProbeCell(p.last_probe, p.last_error, p.blocked_model_ids);
+  const checked = selectedAccountIds.has(a.id) ? "checked" : "";
+  const expiryCell = fmtExpiry(a.expires_at);
+  return `
+    <tr data-acc-id="${esc(a.id)}">
+      <td><input type="checkbox" class="acc-check-one" data-id="${esc(a.id)}" ${checked} /></td>
+      <td>${esc(a.email || "—")}<div class="muted mono" style="font-size:0.72rem">${esc(a.id)}</div></td>
+      <td>${a.expired ? '<span class="g2a-tag bad">已过期</span>' : '<span class="g2a-tag ok">有效</span>'}</td>
+      <td>${poolLabel}</td>
+      <td class="g2a-muted" style="font-size:0.8rem">${usage}</td>
+      <td style="font-size:0.82rem;min-width:140px">${fmtQuotaCell({ ...p, id: a.id }, liveQ)}</td>
+      <td style="font-size:0.78rem;min-width:160px">${probeCell}</td>
+      <td style="font-size:0.8rem;min-width:150px">
+        ${expiryCell}
+        <div style="margin-top:6px">${refreshPill}</div>
+      </td>
+      <td class="g2a-actions">
+        <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="renew-one" data-id="${esc(a.id)}" ${a.has_refresh_token ? "" : "disabled title=\"无 refresh_token，无法续期\""}>续期</button>
+        <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="probe-one" data-id="${esc(a.id)}">模型测试</button>
+        <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="quota-one" data-id="${esc(a.id)}">额度</button>
+        <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="toggle-acc" data-id="${esc(a.id)}" data-on="${enabled ? 0 : 1}">${enabled ? "禁用" : "启用"}</button>
+        <button class="g2a-btn g2a-btn-danger g2a-btn-sm" data-act="rm-acc" data-id="${esc(a.id)}">移除</button>
+      </td>
+    </tr>`;
+}
+
+function patchAccountRowById(id) {
+  if (!id) return;
+  const row = document.querySelector(`tr[data-acc-id="${CSS.escape(String(id))}"]`);
+  const acc = (accountsList || []).find((a) => a.id === id);
+  if (!acc) return;
+  const html = renderOneAccountRow(acc);
+  if (row) {
+    row.outerHTML = html;
+  } else {
+    // fallback: only re-render page if row not in DOM
+    try { renderAccountsPage(); } catch (_) {}
+  }
+}
+
+function refreshOneAccountLocal(id, patch) {
+  // Local-only UI update. NEVER reload accounts list/page component.
+  if (patch) upsertAccountInList({ id, ...patch });
+  else upsertAccountInList({ id });
+  patchAccountRowById(id);
+}
+
+function setRowBusy(id, busy, label) {
+  const row = document.querySelector(`tr[data-acc-id="${CSS.escape(String(id))}"]`);
+  if (row) {
+    row.classList.toggle("is-busy", !!busy);
+    if (busy && label) row.dataset.busyLabel = label;
+    else delete row.dataset.busyLabel;
+  }
+  const buttons = row
+    ? row.querySelectorAll("button[data-id]")
+    : document.querySelectorAll(`button[data-id="${CSS.escape(String(id))}"]`);
+  buttons.forEach((btn) => {
+    btn.disabled = !!busy;
+    if (busy) {
+      if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+      if (label && (
+        (label.includes("续期") && btn.dataset.act === "renew-one") ||
+        ((label.includes("探测") || label.includes("测试") || label.includes("测活")) && btn.dataset.act === "probe-one") ||
+        (label.includes("查询") && btn.dataset.act === "quota-one") ||
+        (label.includes("处理") && btn.dataset.act === "toggle-acc") ||
+        (label.includes("移除") && btn.dataset.act === "rm-acc")
+      )) {
+        btn.textContent = label;
+      }
+    } else if (btn.dataset.label) {
+      btn.textContent = btn.dataset.label;
+      delete btn.dataset.label;
+    }
+  });
+  // Live status cell hint while busy.
+  if (row) {
+    const statusCell = row.children && row.children[3];
+    if (statusCell) {
+      if (busy && label) {
+        if (!statusCell.dataset.prevHtml) statusCell.dataset.prevHtml = statusCell.innerHTML;
+        statusCell.innerHTML = `<span class="g2a-tag warn">${esc(label)}</span>`;
+      } else if (statusCell.dataset.prevHtml) {
+        // Will be replaced by patchAccountRowById shortly; keep fallback.
+        delete statusCell.dataset.prevHtml;
+      }
+    }
+  }
+}
+
+function poolPatchFromProbeResponse(r) {
+  const res = (r && (r.result || r)) || {};
+  const pool = (r && r.pool) || {};
+  const ok = !!(r && (r.ok || res.available));
+  const nowSec = Math.floor(Date.now() / 1000);
+  const patch = {
+    last_probe: pool.last_probe || {
+      available: ok,
+      ok,
+      model: res.model || pool.cooldown_model || null,
+      latency_ms: res.latency_ms,
+      status_code: res.status_code,
+      error: res.error || (!ok ? (r && r.error) : null) || null,
+      probed_at: nowSec,
+    },
+    last_error: ok ? (pool.last_error || null) : (pool.last_error || res.error || (r && r.error) || null),
+    last_probe_status: pool.last_probe_status || (ok ? "normal" : "error"),
+    consecutive_fails: pool.consecutive_fails != null ? pool.consecutive_fails : (ok ? 0 : undefined),
+    probe_fail_streak: pool.probe_fail_streak,
+    blocked_model_ids: pool.blocked_model_ids,
+    disabled_for_quota: pool.disabled_for_quota,
+  };
+  if (pool.pool_status) patch.pool_status = pool.pool_status;
+  if (pool.in_cooldown != null) patch.in_cooldown = !!pool.in_cooldown;
+  if (pool.cooldown_count != null) patch.cooldown_count = Number(pool.cooldown_count) || 0;
+  if (pool.cooldown_until !== undefined) patch.cooldown_until = pool.cooldown_until;
+  if (pool.cooldown_sec !== undefined) patch.cooldown_sec = pool.cooldown_sec;
+  if (pool.cooldown_reason !== undefined) patch.cooldown_reason = pool.cooldown_reason;
+  if (pool.cooldown_code !== undefined) patch.cooldown_code = pool.cooldown_code;
+  if (pool.cooldown_model !== undefined) patch.cooldown_model = pool.cooldown_model;
+  if (pool.cooldown_tokens_actual !== undefined) patch.cooldown_tokens_actual = pool.cooldown_tokens_actual;
+  if (pool.cooldown_tokens_limit !== undefined) patch.cooldown_tokens_limit = pool.cooldown_tokens_limit;
+  if (Array.isArray(pool.status_stack)) patch.status_stack = pool.status_stack;
+
+  // Fallback when backend older / no pool payload.
+  if (!r || !r.pool) {
+    if (ok) {
+      patch.in_cooldown = false;
+      patch.cooldown_count = 0;
+      patch.status_stack = [];
+      patch.cooldown_until = null;
+      patch.cooldown_sec = null;
+      patch.pool_status = "normal";
+      patch.consecutive_fails = 0;
+    } else if (/free-usage-exhausted|free usage|subscription:free-usage/i.test(String(res.error || r.error || ""))) {
+      patch.in_cooldown = true;
+      patch.pool_status = "cooldown";
+      patch.cooldown_count = Math.max(1, Number(patch.cooldown_count || 0) || 1);
+      patch.cooldown_code = patch.cooldown_code || "subscription:free-usage-exhausted";
+    }
+  }
+  return patch;
+}
+
+function applyAccountLivePatch(id, partial) {
+  if (!id) return;
+  upsertAccountInList({ id, ...(partial || {}) });
+  refreshOneAccountLocal(id, partial || null);
+}
+
+async function renewAccounts(ids, { confirmMany = true } = {}) {
+  const list = Array.from(new Set((ids || []).map(x => String(x || "").trim()).filter(Boolean)));
+  if (!list.length) {
+    toast("请先选择要续期的账号", false);
+    return;
+  }
+  if (confirmMany && list.length > 1) {
+    if (!confirm(`确认续期选中的 ${list.length} 个账号？将调用 refresh_token 更新 access token。`)) return;
+  }
+  // Mark all selected rows busy for live feedback.
+  list.forEach((id) => setRowBusy(id, true, "续期中"));
+  try {
+    const r = await api("/accounts/refresh", {
+      method: "POST",
+      body: JSON.stringify({ force: true, ids: list }),
+    });
+    const results = r.results || [];
+    const byId = new Map();
+    results.forEach((x) => {
+      const id = x.id || x.account_id || x.auth_key;
+      if (id) byId.set(String(id), x);
+    });
+    let n = 0, failed = 0, skipped = 0;
+    list.forEach((id) => {
+      const x = byId.get(String(id));
+      if (!x) {
+        // still clear busy; unknown result
+        setRowBusy(id, false);
+        return;
+      }
+      if (x.ok && !x.skipped) {
+        n += 1;
+        applyAccountLivePatch(id, {
+          expires_at: x.expires_at,
+          expired: false,
+          has_refresh_token: x.has_refresh_token != null ? x.has_refresh_token : true,
+          _pool: {
+            last_error: null,
+          },
+        });
+      } else if (x.ok && x.skipped) {
+        skipped += 1;
+        applyAccountLivePatch(id, {
+          expires_at: x.expires_at,
+          has_refresh_token: x.has_refresh_token,
+        });
+      } else {
+        failed += 1;
+        applyAccountLivePatch(id, {
+          _pool: {
+            last_error: x.error || x.message || "续期失败",
+          },
+        });
+      }
+      setRowBusy(id, false);
+    });
+    let msg = `续期完成：成功 ${n}`;
+    if (failed) msg += `，失败 ${failed}`;
+    if (skipped) msg += `，跳过 ${skipped}`;
+    toast(msg, failed === 0);
+  } catch (e) {
+    list.forEach((id) => setRowBusy(id, false));
+    toast(e.message, false);
+  }
+}
+
+async function exportSelectedAccounts() {
+  const ids = Array.from(selectedAccountIds);
+  if (!ids.length) {
+    toast("请先勾选要导出的账号", false);
+    return;
+  }
+  try {
+    const res = await fetch("/admin/api/accounts/export-batch?download=1", {
+      method: "POST",
+      headers: headers(true),
+      body: JSON.stringify({ ids, include_secrets: true }),
+    });
+    if (!res.ok) {
+      let msg = res.statusText;
+      try {
+        const d = await res.json();
+        msg = d.detail || d.error || msg;
+      } catch {}
+      throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+    }
+    const blob = await res.blob();
+    const cd = res.headers.get("Content-Disposition") || "";
+    let filename = `grok2api-auth-export-selected-${ids.length}.json`;
+    const m = /filename=\"?([^\";]+)\"?/.exec(cd);
+    if (m) filename = m[1];
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    toast(`已导出选中 ${ids.length} 个账号`);
+  } catch (e) {
+    toast(e.message, false);
+  }
+}
+
+on("acc-page-prev", "onclick", () => { if (accountsPage > 1 && !accountsLoading) { accountsPage--; loadAccountsPage(); } });
+on("acc-page-next", "onclick", () => { if (!accountsLoading && accountsPage < (accountsTotalPages || 1)) { accountsPage++; loadAccountsPage(); } });
+on("acc-page-size", "onchange", () => {
+  accountsPageSize = parseInt(($("acc-page-size") && $("acc-page-size").value) || "25", 10) || 25;
+  accountsPage = 1;
+  renderAccountsPage();
+});
+
+if ($("btn-acc-search")) $("btn-acc-search").onclick = () => applyAccountSearch(true);
+if ($("btn-acc-search-clear")) $("btn-acc-search-clear").onclick = () => {
+  if ($("acc-search")) $("acc-search").value = "";
+  applyAccountSearch(true);
+};
+if ($("acc-search")) {
+  $("acc-search").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") applyAccountSearch(true);
+  });
+}
+if ($("btn-acc-select-page")) $("btn-acc-select-page").onclick = () => setPageSelection(true);
+if ($("btn-acc-select-all-filtered")) $("btn-acc-select-all-filtered").onclick = () => { setPageSelection(true); toast("已选择本页账号（服务端分页）"); };
+if ($("btn-acc-select-none")) $("btn-acc-select-none").onclick = () => {
+  selectedAccountIds.clear();
+  renderAccountsPage();
+};
+if ($("btn-acc-delete-selected")) $("btn-acc-delete-selected").onclick = () => deleteSelectedAccounts();
+if ($("btn-acc-renew-selected")) $("btn-acc-renew-selected").onclick = () => renewAccounts(Array.from(selectedAccountIds));
+  if ($("btn-acc-probe-selected")) $("btn-acc-probe-selected").onclick = () => probeAccounts(Array.from(selectedAccountIds));
+if ($("btn-acc-export-selected")) $("btn-acc-export-selected").onclick = () => exportSelectedAccounts();
+if ($("acc-check-page")) {
+  on("acc-check-page", "onchange", (e) => setPageSelection(!!e.target.checked));
+}
+
+function fmtProbeCell(lastProbe, lastError, blockedIds) {
+  const lp = lastProbe || null;
+  if (!lp) {
+    const err = lastError
+      ? `<div class="g2a-muted" title="${esc(lastError)}" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(String(lastError).slice(0, 48))}</div>`
+      : '<span class="g2a-muted">未探测</span>';
+    return err;
+  }
+  const ok = lp.available || lp.ok;
+  const pill = ok ? '<span class="g2a-tag ok">正常</span>' : '<span class="g2a-tag bad">报错</span>';
+  const model = lp.model ? `<span class="mono">${esc(lp.model)}</span>` : "";
+  const when = lp.probed_at ? fmtTime(lp.probed_at) : "";
+  const blocked = (blockedIds && blockedIds.length)
+    ? `<div class="g2a-muted">屏蔽: ${esc(blockedIds.join(", "))}</div>`
+    : "";
+  const err = (!ok && lp.error)
+    ? `<div class="g2a-muted" title="${esc(lp.error)}" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(String(lp.error).slice(0, 60))}</div>`
+    : "";
+  return `${pill} ${model}<div class="g2a-muted">${when}</div>${err}${blocked}`;
+}
+
+async function refreshAllQuota(force = true) {
+  // force=false => read DB cache only; force=true => live query and persist.
+  const btnIds = ["btn-refresh-quota", "btn-refresh-quota-2"];
+  btnIds.forEach((id) => { const el = $(id); if (el) { el.disabled = true; if (!el.dataset.label) el.dataset.label = el.textContent; el.textContent = force ? "查询中…" : "读取缓存…"; } });
+  try {
+    const path = force ? "/accounts/quota?refresh=1" : "/accounts/quota?cached=1";
+    const data = await api(path);
+    const rows = data.results || data.accounts || data.quotas || [];
+    // keep existing cache, update with returned rows
+    rows.forEach((q) => {
+      if (q && q.account_id) quotaCache[q.account_id] = q;
+    });
+    // also reflect onto current page rows
+    (accountsList || []).forEach((a) => {
+      const q = quotaCache[a.id];
+      if (!q) return;
+      a._pool = a._pool || { id: a.id };
+      a._pool.last_quota = q;
+      if (q.auto_disabled || q.exhausted) {
+        a._pool.disabled_for_quota = true;
+        a._pool.enabled = false;
+      }
+    });
+    try { renderAccountsPage(); } catch (_) {}
+    const qs = $("quota-summary");
+    if (qs) {
+      const total = data.count ?? rows.length;
+      const exhausted = data.exhausted_count ?? rows.filter(x => x.exhausted || x.auto_disabled).length;
+      const cached = data.cached ? "缓存" : "实时";
+      qs.textContent = `额度(${cached})：${total} 个账号 · 耗尽 ${exhausted}`;
+    }
+    const ok = (data.ok_count != null ? data.ok_count : rows.filter(x => x.ok && !x.exhausted).length);
+    toast(force ? `额度已刷新：可用 ${ok}/${data.count ?? rows.length}` : `已加载缓存额度：${rows.length} 条`, true);
+  } catch (e) {
+    toast(e.message || "额度查询失败", false);
+  } finally {
+    btnIds.forEach((id) => { const el = $(id); if (el) { el.disabled = false; el.textContent = el.dataset.label || "查询全部额度"; } });
+  }
+}
+
+
+function renderModels() {
+  const models = (dashCache && dashCache.models) || [];
+  const tbody = $("models-tbody");
+  if (!tbody) return;
+  tbody.innerHTML = models.map(m => `
+    <tr>
+      <td class="mono">${esc(m.id)}</td>
+      <td>${esc(m.name || "—")}</td>
+      <td class="g2a-muted">${m.context_window ? m.context_window.toLocaleString() : "—"}</td>
+      <td class="g2a-muted">${m.supports_reasoning_effort ? "是" : "—"}</td>
+    </tr>
+  `).join("") || `<tr><td colspan="4" class="g2a-muted">无模型缓存，使用默认 grok-4.5</td></tr>`;
+}
+
+function renderModelHealthInfo() {
+  const el = $("model-health-info");
+  const pill = $("model-health-pill");
+  const mh = (dashCache && dashCache.model_health)
+    || (statusCache && statusCache.model_health)
+    || {};
+  const settings = (dashCache && dashCache.settings) || (statusCache && statusCache.settings) || {};
+  const enabled = mh.enabled !== false && settings.model_health_enabled !== false;
+  const chk = $("chk-model-health");
+  if (chk && document.activeElement !== chk) chk.checked = !!enabled;
+  if (pill) {
+    if (!enabled) {
+      pill.className = "g2a-tag warn";
+      pill.textContent = "● 已关闭";
+    } else if (mh.running || mh.cluster_running || mh.leader_running) {
+      pill.className = "g2a-tag ok";
+      pill.textContent = "● 探测运行中";
+    } else if (mh.enabled) {
+      pill.className = "g2a-tag ok";
+      pill.textContent = "● 已启用（后台）";
+    } else {
+      pill.className = "g2a-tag bad";
+      pill.textContent = "● 未运行";
+    }
+  }
+  if (!el) return;
+  if (!enabled) {
+    el.textContent = "模型探测：已关闭（可在下方开关重新开启）";
+    return;
+  }
+  const last = mh.last || null;
+  const sweep = mh.sweep || (last && last.sweep) || null;
+  let lastTxt = "尚未跑过周期探测";
+  if (last && (last.at || last.probed_at || last.count != null)) {
+    const parts = [
+      `上次 ${fmtTime(last.at || last.probed_at)}`,
+      `可用 ${last.available_count ?? "—"}/${last.count ?? "—"}`,
+      `自动处理 ${last.auto_action_count ?? 0}`,
+    ];
+    if (last.kick_cooldown || last.kick_disabled) {
+      parts.push(`踢出 冷却${last.kick_cooldown || 0}/硬${last.kick_disabled || 0}`);
+    }
+    if (last.deferred != null) parts.push(`延后 ${last.deferred}`);
+    lastTxt = parts.join(" · ");
+  }
+  let sweepTxt = "";
+  if (sweep && (sweep.covered != null || sweep.generation)) {
+    const live = sweep.live ?? sweep.sweep_live;
+    const left = sweep.remaining ?? sweep.sweep_remaining;
+    sweepTxt = ` · 扫池 ${sweep.covered ?? 0}${live != null ? "/" + live : ""}${left != null ? " 剩余" + left : ""}`;
+  }
+  el.textContent =
+    `模型探测：后台每 ${mh.interval_sec ?? "?"}s 检查 · 每批 ${mh.probe_batch ?? "?"} · 模型 ${(mh.probe_models || []).join(", ") || "—"} · ${lastTxt}${sweepTxt}`;
+}
+
+async function runAccountProbe(accountId, model) {
+  setLogPanel("probe-result", `探测中… account=${accountId}`, { forceShow: true });
+  setRowBusy(accountId, true, "探测中");
+  try {
+    const body = { auto_disable: true };
+    if (model) body.model = model;
+    const r = await api("/accounts/" + encodeURIComponent(accountId) + "/probe", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    const res = r.result || r;
+    const ok = !!(r.ok || res.available);
+    const pool = r.pool || {};
+    const recovered = !!(res.auto_action && res.auto_action.recovered)
+      || !!(pool.pool_status === "normal" && ok)
+      || !!(r.pool_status === "normal" && ok);
+    const cooling = !!(pool.in_cooldown || r.in_cooldown || pool.pool_status === "cooldown");
+    const lines = [
+      ok ? "✓ 探测成功" : "✗ 探测失败",
+      `账号: ${r.email || res.email || accountId}`,
+      `模型: ${res.model || pool.cooldown_model || "—"}`,
+      res.latency_ms != null ? `耗时: ${res.latency_ms} ms` : null,
+      res.status_code != null ? `HTTP: ${res.status_code}` : null,
+      res.error ? `错误: ${res.error}` : null,
+      cooling ? "状态：冷却中（已写库）" : null,
+      ok && recovered ? "状态：冷却中 → 正常（已写库）" : null,
+      pool.cooldown_code ? `code: ${pool.cooldown_code}` : null,
+      res.auto_disabled ? "已自动屏蔽模型 / 移出轮询" : null,
+    ].filter(Boolean);
+    setLogPanel("probe-result", lines.join("\n"), { forceShow: true });
+    toast(
+      ok
+        ? (recovered ? "测活成功，已恢复为正常" : "账号模型探测成功")
+        : (cooling ? "测活失败，已进入冷却中" : (res.error || r.error || "探测失败")),
+      ok
+    );
+    const poolPatch = poolPatchFromProbeResponse(r);
+    applyAccountLivePatch(accountId, {
+      email: r.email || res.email,
+      _pool: poolPatch,
+    });
+  } catch (e) {
+    setLogPanel("probe-result", "✗ " + e.message, { forceShow: true });
+    toast(e.message, false);
+  } finally {
+    setRowBusy(accountId, false);
+  }
+}
+
+async function probeAccounts(ids, { confirmMany = true } = {}) {
+  const list = Array.from(new Set((ids || []).map((x) => String(x || "").trim()).filter(Boolean)));
+  if (!list.length) {
+    toast("请先选择要测试的账号", false);
+    return;
+  }
+  if (confirmMany && list.length > 1) {
+    if (!confirm(`确认对选中的 ${list.length} 个账号执行模型测试？状态会实时更新。`)) return;
+  }
+  if (list.length === 1) {
+    await runAccountProbe(list[0]);
+    return;
+  }
+  list.forEach((id) => setRowBusy(id, true, "探测中"));
+  setLogPanel("probe-result", `批量探测中… ×${list.length}`, { forceShow: true });
+  try {
+    const r = await api("/accounts/probe-batch", {
+      method: "POST",
+      body: JSON.stringify({ ids: list, auto_disable: true }),
+    });
+    const results = Array.isArray(r.results) ? r.results : [];
+    let okN = 0, badN = 0, coolN = 0;
+    const lines = [`批量模型测试完成：${results.length}/${list.length}`];
+    results.forEach((item) => {
+      const id = item.account_id || item.id;
+      if (!id) return;
+      const res = item.result || item;
+      const ok = !!(item.ok || res.available);
+      const pool = item.pool || {};
+      if (ok) okN += 1; else badN += 1;
+      if (pool.in_cooldown || item.in_cooldown || pool.pool_status === "cooldown") coolN += 1;
+      applyAccountLivePatch(id, {
+        email: item.email || res.email,
+        _pool: poolPatchFromProbeResponse(item),
+      });
+      setRowBusy(id, false);
+      lines.push(
+        `${ok ? "✓" : "✗"} ${item.email || id}` +
+          (pool.pool_status ? ` · ${pool.pool_status}` : "") +
+          ((pool.in_cooldown || pool.pool_status === "cooldown") ? " · 冷却中" : "") +
+          (res.error ? ` · ${String(res.error).slice(0, 80)}` : "")
+      );
+    });
+    // any ids missing from response
+    list.forEach((id) => setRowBusy(id, false));
+    lines.splice(1, 0, `成功 ${okN} · 失败 ${badN} · 冷却 ${coolN}`);
+    setLogPanel("probe-result", lines.join("\n"), { forceShow: true });
+    toast(`批量测活：成功 ${okN} · 失败 ${badN} · 冷却 ${coolN}`, badN === 0);
+  } catch (e) {
+    list.forEach((id) => setRowBusy(id, false));
+    setLogPanel("probe-result", "✗ " + e.message, { forceShow: true });
+    toast(e.message, false);
+  }
+}
+
+async function runProbeAll() {
+  const btns = ["btn-probe-all", "btn-probe-all-2"].map((id) => $(id)).filter(Boolean);
+  const startedAt = Date.now();
+  btns.forEach((b) => {
+    try {
+      b.disabled = true;
+      b.dataset._oldText = b.textContent;
+      b.textContent = "探测中…";
+    } catch (_) {}
+  });
+  toast("已开始全部账号模型探测，请稍候…");
+  setLogPanel(
+    "probe-result",
+    "正在探测全部账号模型…\n（后台执行中，完成后自动刷新列表）",
+    { forceShow: true }
+  );
+  try {
+    const r = await api("/accounts/probe-all", { method: "POST", body: "{}" });
+    const elapsed = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+    const lines = [
+      `全部账号模型探测完成（${elapsed}s）`,
+      `探测账号 ${r.count ?? 0}` + (r.deferred ? ` · 延后 ${r.deferred}` : ""),
+      `可用 ${r.available_count ?? 0}/${r.count ?? 0}`,
+      `不可用 ${r.unavailable_count ?? 0}`,
+      `自动处理 ${r.auto_action_count ?? 0}` + (r.kick_cooldown ? ` · 进入冷却 ${r.kick_cooldown}` : ""),
+      `模型 ${(r.models || []).join(", ") || "—"}`,
+    ];
+    const bad = (r.results || []).filter((x) => !x.available);
+    bad.slice(0, 8).forEach((x) => {
+      let err = String(x.error || "error");
+      if (/free-usage-exhausted|free usage/i.test(err)) {
+        err = "临时额度耗尽，已冷却，等待下次测活成功";
+      } else if (err.startsWith("{") && err.length > 120) {
+        err = err.slice(0, 120) + "…";
+      }
+      lines.push(`- ${x.email || x.account_id}: ${err}`);
+    });
+    setLogPanel("probe-result", lines.join("\n"), { forceShow: true });
+    toast(`探测完成：${r.available_count ?? 0}/${r.count ?? 0} 可用`);
+    // Immediately reflect latest probe cycle on overview text.
+    statusCache = statusCache || {};
+    dashCache = dashCache || {};
+    const mh = Object.assign({}, statusCache.model_health || {}, {
+      last: Object.assign({}, r, { at: Date.now() / 1000, probed_at: r.probed_at || Date.now() / 1000 }),
+    });
+    if (r.sweep) mh.sweep = r.sweep;
+    statusCache.model_health = mh;
+    dashCache.model_health = mh;
+    try { renderModelHealthInfo(); } catch (_) {}
+    try { renderMaintainer(); } catch (_) {}
+    try { renderStats(); } catch (_) {}
+    try { await refreshOverviewStatus({ force: true, render: true }); } catch (_) {}
+    try { await loadAccountsPage({ reset: false }); } catch (_) {}
+  } catch (e) {
+    setLogPanel("probe-result", "✗ " + (e.message || e), { forceShow: true });
+    toast(e.message || "全部探测失败", false);
+  } finally {
+    btns.forEach((b) => {
+      try {
+        b.disabled = false;
+        if (b.dataset._oldText) b.textContent = b.dataset._oldText;
+      } catch (_) {}
+    });
+  }
+}
+
+let lastAutoTokenRefreshAt = 0;
+let _autoRefreshInFlight = false;
+function startAutoUiRefresh() {
+  if (uiRefreshTimer) return;
+  uiRefreshTimer = setInterval(async () => {
+    try {
+      const page = document.body.dataset.page || pageFromPath(location.pathname) || "overview";
+      if (page !== "overview") return;
+      if (document.hidden) return;
+      const chk = $("chk-auto-refresh-ui");
+      if (chk && !chk.checked) return;
+      if (_autoRefreshInFlight) return;
+      _autoRefreshInFlight = true;
+      try {
+        const now = Date.now();
+        if (!statusCache || (now - (_statusFetchedAt || 0)) > 5000) {
+          statusCache = await api("/status");
+          _statusFetchedAt = Date.now();
+          if (window.G2A && G2A.state) G2A.state.status = statusCache;
+        }
+        try { renderStats(); } catch (_) {}
+        try { renderMaintainer(); } catch (_) {}
+        try { renderModelHealthInfo(); } catch (_) {}
+        try { renderStoreConn("overview-conn"); } catch (_) {}
+        const tm = (statusCache && statusCache.token_maintainer) || {};
+        const rem = tm.min_remaining_sec;
+        if (rem != null && rem < 15 * 60 && Date.now() - lastAutoTokenRefreshAt > 5 * 60 * 1000) {
+          lastAutoTokenRefreshAt = Date.now();
+          try { await api("/accounts/refresh", { method: "POST", body: JSON.stringify({ force: false }) }); } catch (_) {}
+        }
+      } finally {
+        _autoRefreshInFlight = false;
+      }
+    } catch (e) {
+      _autoRefreshInFlight = false;
+      if (e && e.status === 401) return;
+      // Ignore transient network errors on overview polling.
+      if (e && (e.network || e.status === 0)) {
+        console.warn("auto refresh network", e.message || e);
+        return;
+      }
+      console.warn("auto refresh", e);
+    }
+  }, 20000);
+}
+
+
+function renderGuide() {
+  const pageOrigin = currentOrigin();
+  let base = (dashCache && dashCache.api_base) || (statusCache && statusCache.api_base) || "";
+  // Prefer current browser origin on public deployments so guides never show 127.0.0.1
+  // when the page itself was opened via domain/public IP.
+  if (pageOrigin && (!base || /127\.0\.0\.1|localhost/i.test(base))) {
+    base = pageOrigin.replace(/\/$/, "") + "/v1";
+  }
+  if (!base) base = "<your-host>/v1";
+  let origin = base.replace(/\/v1\/?$/, "");
+  if (!origin) origin = pageOrigin || "<your-host>";
+  const model = (dashCache && dashCache.default_model) || (statusCache && statusCache.default_model) || "grok-4.5";
+  $("guide-base").textContent = base;
+  $("guide-model").textContent = model;
+  $("guide-curl").textContent = `curl ${base}/chat/completions \\
+  -H "Authorization: Bearer sk-g2a-YOUR_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"${model}","messages":[{"role":"user","content":"你好"}],"stream":false}'`;
+  $("guide-py").textContent = `from openai import OpenAI
+client = OpenAI(base_url="${base}", api_key="sk-g2a-YOUR_KEY")
+r = client.chat.completions.create(
+    model="${model}",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+print(r.choices[0].message.content)
+
+# Tools / Function Calling 示例
+tools = [{
+  "type": "function",
+  "function": {
+    "name": "get_weather",
+    "description": "Get weather",
+    "parameters": {
+      "type": "object",
+      "properties": {"city": {"type": "string"}},
+      "required": ["city"],
+    },
+  },
+}]
+r = client.chat.completions.create(
+    model="${model}",
+    messages=[{"role": "user", "content": "北京天气？"}],
+    tools=tools,
+    tool_choice="auto",
+)
+print(r.choices[0].message.tool_calls or r.choices[0].message.content)`;
+  if ($("guide-anthropic")) {
+    $("guide-anthropic").textContent = `# Anthropic Messages API
+# Base URL 填网关根地址（或带 /v1）；鉴权用 x-api-key
+curl ${origin}/v1/messages \\
+  -H "x-api-key: sk-g2a-YOUR_KEY" \\
+  -H "anthropic-version: 2023-06-01" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"${model}","max_tokens":1024,"messages":[{"role":"user","content":"你好"}]}'
+
+# Python anthropic SDK
+from anthropic import Anthropic
+client = Anthropic(base_url="${origin}", api_key="sk-g2a-YOUR_KEY")
+msg = client.messages.create(
+    model="${model}",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Hello"}],
+)
+print(msg.content[0].text)
+
+# Claude Code / 其他工具：API Base = ${origin}  或  ${origin}/v1
+# 模型名可用 claude-* 别名，会自动映射到默认 Grok 模型`;
+  }
+  $("guide-linux").textContent = `# Linux 服务器部署
+cp .env.example .env
+# 编辑 .env（GROK2API_ADMIN_PASSWORD 等）
+# 默认 GROK2API_REASONING_COMPAT=off
+pip install -r requirements.txt
+./start.sh
+# 或后台：
+# nohup ./start.sh > grok2api.log 2>&1 &
+# 授权：管理台 → 设备码登录（无需 grok CLI）`;
+}
+
+/* ── Email registration ─────────────────────────────── */
+const REG_CONFIG_KEY = "g2a_registration_config_v1";
+let regConfigCache = null;
+let regConfigLoadedAt = 0;
+
+function readRegConfig() {
+  return {
+    base_url: $("reg-base-url") ? $("reg-base-url").value.trim() : "",
+    prefix: $("reg-prefix") ? $("reg-prefix").value.trim() : "",
+    domain: $("reg-domain") ? $("reg-domain").value.trim() : "",
+    expiry_ms: $("reg-expiry-ms") ? $("reg-expiry-ms").value.trim() : "",
+    api_key: $("reg-api-key") ? $("reg-api-key").value.trim() : "",
+    yescaptcha_key: $("reg-yescaptcha-key") ? $("reg-yescaptcha-key").value.trim() : "",
+    proxy: $("reg-proxy") ? $("reg-proxy").value.trim() : "",
+    proxy_username: $("reg-proxy-username") ? $("reg-proxy-username").value.trim() : "",
+    proxy_password: $("reg-proxy-password") ? $("reg-proxy-password").value.trim() : "",
+    count: $("reg-count") ? $("reg-count").value.trim() : "1",
+    concurrency: $("reg-concurrency") ? $("reg-concurrency").value.trim() : "3",
+    stagger_ms: $("reg-stagger-ms") ? $("reg-stagger-ms").value.trim() : "400",
+  };
+}
+// MoeMail official EXPIRY_OPTIONS only:
+// 1h / 24h / 3d / permanent (0). See beilunyang/moemail app/types/email.ts
+const MOEMAIL_EXPIRY_PRESETS = [3600000, 86400000, 259200000, 0];
+
+function normalizeRegExpiryMs(value) {
+  const raw = value == null ? "" : String(value).trim();
+  if (raw === "" || raw == null) return "3600000"; // default 1 hour
+  if (raw === "0") return "0";
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n)) return "3600000";
+  if (MOEMAIL_EXPIRY_PRESETS.includes(n)) return String(n);
+  // Map legacy free-form ms to the nearest official preset (exclude permanent=0).
+  const timed = [3600000, 86400000, 259200000];
+  let best = timed[0];
+  let bestDiff = Math.abs(n - best);
+  for (const p of timed) {
+    const d = Math.abs(n - p);
+    if (d < bestDiff) {
+      best = p;
+      bestDiff = d;
+    }
+  }
+  return String(best);
+}
+
+function applyRegConfig(cfg) {
+  if (!cfg || typeof cfg !== "object") return;
+  if ($("reg-base-url")) $("reg-base-url").value = cfg.base_url || "";
+  if ($("reg-prefix")) $("reg-prefix").value = cfg.prefix || "";
+  if ($("reg-domain")) $("reg-domain").value = cfg.domain || "";
+  if ($("reg-expiry-ms")) {
+    const exp = normalizeRegExpiryMs(cfg.expiry_ms);
+    $("reg-expiry-ms").value = exp;
+    // Keep select valid if browser rejected an unexpected value.
+    if ($("reg-expiry-ms").value !== exp) $("reg-expiry-ms").value = "3600000";
+  }
+  if ($("reg-api-key")) $("reg-api-key").value = cfg.api_key || "";
+  if ($("reg-yescaptcha-key")) $("reg-yescaptcha-key").value = cfg.yescaptcha_key || "";
+  if ($("reg-proxy")) $("reg-proxy").value = cfg.proxy || "";
+  if ($("reg-proxy-username")) $("reg-proxy-username").value = cfg.proxy_username || "";
+  if ($("reg-proxy-password")) $("reg-proxy-password").value = cfg.proxy_password || "";
+  if ($("reg-count")) $("reg-count").value = cfg.count != null ? String(cfg.count) : "1";
+  if ($("reg-concurrency")) $("reg-concurrency").value = cfg.concurrency != null ? String(cfg.concurrency) : "3";
+  if ($("reg-stagger-ms")) $("reg-stagger-ms").value = cfg.stagger_ms != null ? String(cfg.stagger_ms) : "400";
+  regConfigCache = Object.assign({}, cfg);
+}
+
+function cacheRegConfigLocal(cfg) {
+  try {
+    localStorage.setItem(REG_CONFIG_KEY, JSON.stringify(cfg || readRegConfig()));
+  } catch (_) {}
+}
+
+async function saveRegConfig() {
+  const cfg = readRegConfig();
+  cacheRegConfigLocal(cfg);
+  try {
+    const r = await api("/accounts/register-email/config", {
+      method: "PUT",
+      body: JSON.stringify(cfg),
+    });
+    const saved = (r && r.config) || cfg;
+    applyRegConfig(saved);
+    cacheRegConfigLocal(saved);
+    toast(r.message || "注册配置已保存到数据库");
+    return saved;
+  } catch (e) {
+    toast((e && e.message) || "保存失败（已写本地缓存）", false);
+    throw e;
+  }
+}
+
+function loadRegConfigLocal() {
+  try {
+    applyRegConfig(JSON.parse(localStorage.getItem(REG_CONFIG_KEY) || "null"));
+  } catch (_) {}
+}
+
+async function loadRegConfig(force) {
+  // Paint local cache first so soft-nav feels instant.
+  if (!force) loadRegConfigLocal();
+  const now = Date.now();
+  if (!force && regConfigCache && now - regConfigLoadedAt < 15000 && $("reg-base-url")) {
+    applyRegConfig(regConfigCache);
+    return regConfigCache;
+  }
+  try {
+    const r = await api("/accounts/register-email/config");
+    const cfg = (r && r.config) || null;
+    if (cfg) {
+      applyRegConfig(cfg);
+      cacheRegConfigLocal(cfg);
+      regConfigLoadedAt = Date.now();
+      return cfg;
+    }
+  } catch (e) {
+    console.warn("loadRegConfig", e);
+  }
+  // Fallback: settings payload may already include registration_config
+  try {
+    const s = (statusCache && statusCache.settings) || (dashCache && dashCache.settings) || null;
+    if (s && s.registration_config) {
+      applyRegConfig(s.registration_config);
+      cacheRegConfigLocal(s.registration_config);
+      regConfigLoadedAt = Date.now();
+      return s.registration_config;
+    }
+  } catch (_) {}
+  loadRegConfigLocal();
+  return regConfigCache;
+}
+function buildRegBody(config) {
+  const body = {};
+  if (config.base_url) body.base_url = config.base_url;
+  if (config.prefix) body.prefix = config.prefix;
+  if (config.domain) body.domain = config.domain;
+  // Always send an official MoeMail preset (including permanent=0).
+  body.expiry_ms = Number.parseInt(normalizeRegExpiryMs(config.expiry_ms), 10);
+  if (config.api_key) body.api_key = config.api_key;
+  if (config.yescaptcha_key) body.yescaptcha_key = config.yescaptcha_key;
+  if (config.proxy) body.proxy = config.proxy;
+  if (config.proxy_username) body.proxy_username = config.proxy_username;
+  if (config.proxy_password) body.proxy_password = config.proxy_password;
+  const count = Number.parseInt(config.count || "1", 10);
+  const concurrency = Number.parseInt(config.concurrency || "3", 10);
+  const stagger = Number.parseInt(config.stagger_ms || "400", 10);
+  if (Number.isFinite(count) && count > 0) body.count = Math.floor(count);
+  if (Number.isFinite(concurrency) && concurrency > 0) body.concurrency = Math.min(10, concurrency);
+  if (Number.isFinite(stagger) && stagger >= 0) body.stagger_ms = Math.min(10000, stagger);
+  return body;
+}
+function buildProxyTestBody(config) {
+  const body = {};
+  if (config.proxy) body.proxy = config.proxy;
+  if (config.proxy_username) body.proxy_username = config.proxy_username;
+  if (config.proxy_password) body.proxy_password = config.proxy_password;
+  return body;
+}
+const REG_TERMINAL_OK = new Set(["success", "completed", "imported"]);
+const REG_TERMINAL_BAD = new Set(["error", "failed", "expired", "protocol_error", "protocol_blocked"]);
+
+function regSessionKey(s) {
+  return (s && (s.id || s.session_id)) || "";
+}
+
+function regStatusOf(s) {
+  return String((s && s.status) || "").toLowerCase();
+}
+
+function summarizeRegSessions(sessions) {
+  const list = Array.isArray(sessions) ? sessions : [];
+  let success = 0;
+  let fail = 0;
+  let probing = 0;
+  let running = 0;
+  for (const s of list) {
+    const st = regStatusOf(s);
+    if (REG_TERMINAL_OK.has(st)) success += 1;
+    else if (REG_TERMINAL_BAD.has(st)) fail += 1;
+    else if (st === "probing") probing += 1;
+    else running += 1;
+  }
+  return {
+    total: list.length,
+    success,
+    fail,
+    probing,
+    running,
+    done: success + fail,
+  };
+}
+
+function collectImportedAccountIds(sessions) {
+  const out = [];
+  const seen = new Set();
+  for (const s of sessions || []) {
+    const ids = Array.isArray(s.imported_account_ids) ? s.imported_account_ids : [];
+    for (const id of ids) {
+      const k = String(id || "").trim();
+      if (!k || seen.has(k)) continue;
+      seen.add(k);
+      out.push(k);
+    }
+    const accounts = Array.isArray(s.imported_accounts) ? s.imported_accounts : [];
+    for (const a of accounts) {
+      const k = String((a && a.id) || "").trim();
+      if (!k || seen.has(k)) continue;
+      seen.add(k);
+      out.push(k);
+    }
+  }
+  return out;
+}
+
+function formatRegSessionLine(s, idx) {
+  const st = regStatusOf(s) || "—";
+  const email = (s && s.email) || "—";
+  const id = regSessionKey(s) || `#${idx + 1}`;
+  const msg = (s && (s.message || s.error)) || "";
+  const probe = s && s.probe;
+  let probeTxt = "";
+  if (probe && typeof probe === "object") {
+    probeTxt = ` | 测活 ok=${probe.ok ?? 0} fail=${probe.fail ?? 0}`;
+  } else if (st === "probing") {
+    probeTxt = " | 测活中…";
+  }
+  const shortMsg = msg ? ` | ${String(msg).slice(0, 120)}` : "";
+  return `[${idx + 1}] ${st.padEnd(10)} ${email} (${id})${probeTxt}${shortMsg}`;
+}
+
+function buildRegLogText(sessions, { batch = null, extraLines = [] } = {}) {
+  const stats = summarizeRegSessions(sessions);
+  const lines = [];
+  lines.push("======== 协议注册进度 ========");
+  if (batch && (batch.batch_id || batch.id)) {
+    lines.push(`batch_id: ${batch.batch_id || batch.id}`);
+  } else if (regBatchId) {
+    lines.push(`batch_id: ${regBatchId}`);
+  }
+  lines.push(
+    `统计: 总数 ${stats.total} · 成功 ${stats.success} · 失败 ${stats.fail}` +
+      (stats.probing ? ` · 测活中 ${stats.probing}` : "") +
+      (stats.running ? ` · 进行中 ${stats.running}` : "")
+  );
+  if (batch && batch.message) lines.push(`batch: ${batch.message}`);
+  lines.push("-------- 会话明细 --------");
+  (sessions || []).forEach((s, i) => lines.push(formatRegSessionLine(s, i)));
+  // Probe details from backend auto-probe
+  const probeRows = [];
+  for (const s of sessions || []) {
+    const results = s && s.probe && Array.isArray(s.probe.results) ? s.probe.results : [];
+    for (const p of results) {
+      probeRows.push(
+        `  · ${p.ok ? "✓" : "✗"} ${p.account_id || "?"} model=${p.model || "—"}` +
+          (p.latency_ms != null ? ` ${p.latency_ms}ms` : "") +
+          (p.error ? ` err=${String(p.error).slice(0, 100)}` : "")
+      );
+    }
+  }
+  if (probeRows.length) {
+    lines.push("-------- 入池测活结果 --------");
+    lines.push(...probeRows);
+  }
+  for (const x of extraLines || []) {
+    if (x) lines.push(String(x));
+  }
+  lines.push("==============================");
+  return lines.join("\n");
+}
+
+function showRegSession(s, opts = {}) {
+  showPanel("reg-session-box");
+  const st = (s && (s.status || s.message)) || "—";
+  if ($("reg-status")) $("reg-status").textContent = st;
+  if ($("reg-email")) $("reg-email").textContent = (s && (s.email || s.id || s.session_id)) || "—";
+  const stats = summarizeRegSessions(s ? [s] : []);
+  const head = `成功 ${stats.success} · 失败 ${stats.fail}` +
+    (stats.probing || stats.running ? ` · 进行中 ${stats.probing + stats.running}` : "");
+  if ($("reg-status") && (stats.total > 0)) {
+    // Keep status as machine status, but annotate counts in log.
+  }
+  const log = buildRegLogText(s ? [s] : [], {
+    batch: opts.batch || null,
+    extraLines: [
+      s && (s.output_tail || s.log) ? String(s.output_tail || s.log).slice(0, 800) : "",
+      head,
+    ].filter(Boolean),
+  });
+  setLogPanel("reg-log", log, { forceShow: true });
+}
+
+function showRegSessionGroup(sessions, opts = {}) {
+  showPanel("reg-session-box");
+  const stats = summarizeRegSessions(sessions);
+  if ($("reg-email")) {
+    $("reg-email").textContent = `${stats.total} 个注册会话` +
+      (regBatchId ? ` · ${regBatchId}` : "");
+  }
+  if ($("reg-status")) {
+    $("reg-status").textContent =
+      `成功 ${stats.success} · 失败 ${stats.fail}` +
+      (stats.probing ? ` · 测活 ${stats.probing}` : "") +
+      (stats.running ? ` · 运行 ${stats.running}` : "");
+  }
+  setLogPanel(
+    "reg-log",
+    buildRegLogText(sessions, { batch: opts.batch || null }),
+    { forceShow: true }
+  );
+}
+
+async function probeImportedAccounts(accountIds, { sessions = [], delaySec = 30 } = {}) {
+  const ids = (accountIds || []).filter((id) => id && !regProbedIds.has(id));
+  if (!ids.length || regProbeRunning) return null;
+  regProbeRunning = true;
+  const wait = Math.max(0, Number(delaySec) || 0);
+  const lines = [];
+  if (wait > 0) {
+    lines.push(`[测活] 新号入池后等待 ${wait}s 再检测 ×${ids.length}…`);
+    try {
+      setLogPanel(
+        "reg-log",
+        buildRegLogText(sessions, { extraLines: lines }),
+        { forceShow: true }
+      );
+    } catch (_) {}
+    await new Promise((resolve) => setTimeout(resolve, wait * 1000));
+  }
+  lines.push(`[测活] 开始检测新入池账号 ×${ids.length}…`);
+  try {
+    setLogPanel(
+      "reg-log",
+      buildRegLogText(sessions, { extraLines: lines }),
+      { forceShow: true }
+    );
+  } catch (_) {}
+  const results = [];
+  for (const id of ids) {
+    regProbedIds.add(id);
+    try {
+      const r = await api("/accounts/" + encodeURIComponent(id) + "/probe", {
+        method: "POST",
+        body: JSON.stringify({ auto_disable: true }),
+      });
+      const detail = (r && r.result) || r || {};
+      const ok = !!(r && r.ok);
+      results.push({
+        account_id: id,
+        ok,
+        model: detail.model || r.model,
+        error: detail.error || r.error || null,
+        latency_ms: detail.latency_ms || detail.elapsed_ms || null,
+      });
+      lines.push(
+        `  ${ok ? "✓" : "✗"} ${id}` +
+          (detail.model ? ` model=${detail.model}` : "") +
+          (detail.error ? ` err=${String(detail.error).slice(0, 100)}` : "")
+      );
+    } catch (e) {
+      results.push({ account_id: id, ok: false, error: (e && e.message) || String(e) });
+      lines.push(`  ✗ ${id} err=${(e && e.message) || e}`);
+    }
+  }
+  const okN = results.filter((x) => x.ok).length;
+  const failN = results.length - okN;
+  lines.push(`[测活] 完成：成功 ${okN} · 失败 ${failN}`);
+  try {
+    setLogPanel(
+      "reg-log",
+      buildRegLogText(sessions, { extraLines: lines }),
+      { forceShow: true }
+    );
+  } catch (_) {}
+  regProbeRunning = false;
+  return { ok: okN, fail: failN, results, lines };
+}
+
+async function pollRegSession() {
+  // Prefer batch endpoint when available for accurate total/success/fail.
+  let batch = null;
+  if (regBatchId) {
+    try {
+      batch = await api("/accounts/register-email/batches/" + encodeURIComponent(regBatchId));
+      if (batch && Array.isArray(batch.session_ids)) {
+        for (const id of batch.session_ids) {
+          if (id && !regSessionIds.includes(id)) regSessionIds.push(id);
+        }
+      }
+    } catch (_) {}
+  }
+
+  const ids = regSessionIds.length ? regSessionIds : (regSessionId ? [regSessionId] : []);
+  if (!ids.length && !batch) return;
+
+  try {
+    let sessions = [];
+    if (batch && Array.isArray(batch.sessions) && batch.sessions.length) {
+      sessions = batch.sessions.slice();
+    } else {
+      for (const id of ids) {
+        try {
+          sessions.push(await api("/accounts/register-email/sessions/" + encodeURIComponent(id)));
+        } catch (_) {}
+      }
+    }
+
+    // Pull all sessions so late-spawned batch workers appear.
+    try {
+      const all = await api("/accounts/register-email/sessions");
+      if (all && Array.isArray(all.sessions)) {
+        const known = new Set(sessions.map(regSessionKey).filter(Boolean));
+        for (const s of all.sessions) {
+          const id = regSessionKey(s);
+          if (!id) continue;
+          const sameBatch =
+            (regBatchId && s.batch_id === regBatchId) ||
+            (sessions.some((x) => x.batch_id && x.batch_id === s.batch_id));
+          if (regSessionIds.includes(id) || sameBatch) {
+            if (!regSessionIds.includes(id)) regSessionIds.push(id);
+            if (!known.has(id)) {
+              sessions.push(s);
+              known.add(id);
+            } else {
+              // refresh existing
+              const idx = sessions.findIndex((x) => regSessionKey(x) === id);
+              if (idx >= 0) sessions[idx] = s;
+            }
+          }
+        }
+        // Prefer batch stats from list endpoint when present.
+        if (!batch && regBatchId && Array.isArray(all.batches)) {
+          batch = all.batches.find((b) => (b.id || b.batch_id) === regBatchId) || batch;
+        }
+      }
+    } catch (_) {}
+
+    if (!sessions.length && !batch) return;
+
+    // Merge batch-level counters into status when session list still spawning.
+    if (batch && (!sessions.length || (batch.count && sessions.length < batch.count))) {
+      // keep showing partial list
+    }
+
+    if (sessions.length <= 1 && !regBatchId) showRegSession(sessions[0] || batch, { batch });
+    else showRegSessionGroup(sessions, { batch });
+
+    const stats = summarizeRegSessions(sessions);
+    // Use batch totals if spawner hasn't emitted all sessions yet.
+    const targetTotal = Math.max(
+      stats.total,
+      Number((batch && (batch.total || batch.count || batch.spawned)) || 0) || 0,
+      regSessionIds.length
+    );
+    const batchDone =
+      batch &&
+      (batch.batch_status === "done" ||
+        batch.batch_status === "partial" ||
+        batch.batch_status === "error" ||
+        (Number(batch.done) > 0 && Number(batch.done) >= Number(batch.total || batch.count || 0)));
+
+    const allTerminal =
+      sessions.length > 0 &&
+      sessions.every((s) => REG_TERMINAL_OK.has(regStatusOf(s)) || REG_TERMINAL_BAD.has(regStatusOf(s)));
+    const finished =
+      allTerminal &&
+      (targetTotal <= 0 || sessions.length >= targetTotal || batchDone || !regBatchId);
+
+    // Fallback client-side probe for imported accounts missing backend probe.
+    const importedIds = collectImportedAccountIds(sessions);
+    const needProbe = importedIds.filter((id) => !regProbedIds.has(id));
+    const backendProbed = sessions.some(
+      (s) => s && s.probe && (s.probe.count > 0 || (Array.isArray(s.probe.results) && s.probe.results.length))
+    );
+    if (needProbe.length && !backendProbed && !regProbeRunning) {
+      // Fire and continue polling; probe results append to log.
+      // New registrations: wait 30s before first health probe.
+      probeImportedAccounts(needProbe, { sessions, delaySec: 30 }).catch(() => {});
+    } else if (backendProbed) {
+      for (const id of importedIds) regProbedIds.add(id);
+    }
+
+    if (!finished || regFinishedNotified) return;
+
+    regFinishedNotified = true;
+    const success = stats.success;
+    const fail = stats.fail;
+    const summary = `注册完成：成功 ${success} · 失败 ${fail}` +
+      (targetTotal ? ` / 共 ${Math.max(targetTotal, success + fail)}` : "");
+
+    // Ensure final log includes summary line.
+    setLogPanel(
+      "reg-log",
+      buildRegLogText(sessions, {
+        batch,
+        extraLines: [
+          `[结束] ${summary}`,
+          backendProbed
+            ? "[测活] 后端已在入池后自动测活（见上方结果）"
+            : (importedIds.length ? "[测活] 已触发/完成新号入池测活" : "[测活] 无成功导入账号"),
+        ],
+      }),
+      { forceShow: true }
+    );
+
+    if (success > 0 && fail === 0) toast(summary);
+    else if (success > 0) toast(summary, true);
+    else toast(summary + "，请查看下方日志", false);
+
+    clearInterval(regPollTimer);
+    regPollTimer = null;
+    try {
+      statusCache = await api("/status");
+      await loadDashboard();
+    } catch (_) {}
+  } catch (_) {}
+}
+
+
+function bindSoftNav() {
+  document.addEventListener("click", (e) => {
+    const a = e.target && e.target.closest ? e.target.closest("a[href]") : null;
+    if (!a) return;
+    if (e.defaultPrevented) return;
+    if (e.button !== 0) return;
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    if (a.target && a.target !== "" && a.target !== "_self") return;
+    let href = a.getAttribute("href") || "";
+    if (!href) return;
+    try {
+      const u = new URL(href, location.origin);
+      if (u.origin !== location.origin) return;
+      href = u.pathname + u.search + u.hash;
+    } catch (_) {
+      return;
+    }
+    if (!href.startsWith("/admin")) return;
+    if (href.startsWith("/admin/login") || href.startsWith("/admin/api")) return;
+    const page = pageFromPath((href.split("?")[0] || "").replace(/\/$/, ""));
+    if (!(page in PAGE_HREF) && page !== "overview") return;
+    e.preventDefault();
+    softNavigate(page);
+  }, true);
+
+  window.addEventListener("popstate", () => {
+    const page = pageFromPath(location.pathname);
+    if (page === "login") return;
+    softNavigate(page, { replace: true, force: true });
+  });
+}
+bindSoftNav();
+
+// Bind once DOM is ready (top-level on() may run before elements exist).
+document.addEventListener("DOMContentLoaded", () => {
+  try { rebindPageControls(); } catch (e) { console.warn(e); }
+});
+if (document.readyState !== "loading") {
+  try { rebindPageControls(); } catch (e) { console.warn(e); }
+}
+
+
+/* ── Events ─────────────────────────────────────────── */
+loadRegConfig();
+
+document.querySelectorAll(".sidebar .nav-btn").forEach(btn => {
+  btn.onclick = () => switchTab(btn.dataset.tab);
+});
+document.querySelectorAll("[data-jump]").forEach(btn => {
+  btn.onclick = () => switchTab(btn.dataset.jump);
+});
+buildMobileNav();
+
+on("auth-submit", "onclick", async () => {  const password = $("password").value;
+  if (!password) return toast("请输入密码", false);
+  try {
+    const setup = statusCache && statusCache.setup_needed;
+    const data = setup
+      ? await api("/setup", { method: "POST", body: JSON.stringify({ password }) })
+      : await api("/login", { method: "POST", body: JSON.stringify({ password }) });
+    token = data.token;
+    localStorage.setItem(TOKEN_KEY, token);
+    if ($("password")) $("password").value = "";
+    statusCache = await api("/status");
+    await loadDashboard();
+    showMain();
+    toast(setup ? "初始化成功" : "登录成功");
+  } catch (e) {
+    toast(e.message, false);
+  }
+});
+if ($("password")) $("password").addEventListener("keydown", e => { if (e.key === "Enter") $("auth-submit")?.click(); });
+on("auth-refresh", "onclick", () => bootstrap());
+on("btn-logout", "onclick", async () => {  try { await api("/logout", { method: "POST" }); } catch {}
+  token = "";
+  localStorage.removeItem(TOKEN_KEY);
+  showAuth(false);
+});
+on("btn-refresh-all", "onclick", async () => {  try {
+    statusCache = await api("/status");
+    await loadDashboard();
+    toast("已刷新");
+  } catch (e) { toast(e.message, false); }
+});
+
+on("btn-create-key", "onclick", async () => {
+  try {
+    const name = ($("key-name") && $("key-name").value) || "default";
+    const note = ($("key-note") && $("key-note").value) || "";
+    const data = await api("/keys", { method: "POST", body: JSON.stringify({ name, note }) });
+    const rec = data.key || data;
+    const full = (rec && (rec.key || rec.secret)) || data.secret || "";
+    const box = $("new-key-box");
+    if (box) {
+      box.classList.remove("hidden");
+      box.innerHTML = `<div style="font-weight:600;margin-bottom:6px;color:var(--ok)">✓ Key 已创建 — 列表中可随时再复制</div>
+      <div class="mono" id="new-key-value" style="user-select:all;word-break:break-all;cursor:pointer" title="点击复制">${esc(full)}</div>
+      <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+        <button class="g2a-btn g2a-btn-primary g2a-btn-sm" id="copy-key">复制 Key</button>
+        <button class="g2a-btn g2a-btn-default g2a-btn-sm" id="dismiss-key">收起</button>
+      </div>`;
+      const doCopy = async () => {
+        if (!full) { toast("Key 为空", false); return; }
+        const ok = await copyText(full);
+        toast(ok ? "已复制 API Key" : "复制失败，请手动选中复制", ok);
+      };
+      on("copy-key", "onclick", doCopy);
+      on("new-key-value", "onclick", doCopy);
+      on("dismiss-key", "onclick", () => box.classList.add("hidden"));
+    }
+    if (full) {
+      const ok = await copyText(full);
+      if (ok) toast("已创建并自动复制到剪贴板");
+    }
+    if ($("key-name")) $("key-name").value = "";
+    if ($("key-note")) $("key-note").value = "";
+    statusCache = await api("/status");
+    await loadDashboard();
+  } catch (e) { toast(e.message, false); }
+});
+
+on("keys-tbody", "onclick", async (e) => {  const btn = e.target.closest("button");
+  if (!btn) return;
+  const id = btn.dataset.id;
+  try {
+    if (btn.dataset.act === "copy") {
+      const k = keysCache[id] || {};
+      let full = k.secret || k.key || "";
+      let regenerated = false;
+      if (!full) {
+        if (!confirm("该 Key 未保存完整值，无法直接复制。是否重新生成一个新 Key？旧 Key 会立即失效。")) return;
+        const data = await api("/keys/" + id + "/regenerate", { method: "POST" });
+        const rec = data.key || data;
+        full = (rec && (rec.key || rec.secret)) || data.secret || "";
+        if (!full) {
+          toast("Key 已重建，但接口未返回完整值，请刷新后再试", false);
+          await loadDashboard();
+          return;
+        }
+        keysCache[id] = rec;
+        regenerated = true;
+      }
+      const ok = await copyText(full);
+      toast(ok ? (regenerated ? "已重建并复制 API Key" : "已复制 API Key") : "复制失败，请手动选中复制", ok);
+      if (regenerated) await loadDashboard();
+      return;
+    }
+    if (btn.dataset.act === "del") {
+      if (!confirm("确定删除此 Key？")) return;
+      await api("/keys/" + id, { method: "DELETE" });
+      toast("已删除");
+    } else if (btn.dataset.act === "toggle") {
+      await api("/keys/" + id, {
+        method: "PATCH",
+        body: JSON.stringify({ enabled: btn.dataset.on === "1" }),
+      });
+      toast("已更新");
+    }
+    statusCache = await api("/status");
+    await loadDashboard();
+  } catch (err) { toast(err.message, false); }
+});
+
+on("accounts-tbody", "onclick", async (e) => {  // checkbox selection
+  const chk = e.target.closest(".acc-check-one");
+  if (chk) {
+    const id = chk.dataset.id;
+    if (!id) return;
+    if (chk.checked) selectedAccountIds.add(id);
+    else selectedAccountIds.delete(id);
+    updateAccountSelectionInfo(getFilteredAccounts().length, document.querySelectorAll(".acc-check-one").length);
+    return;
+  }
+
+  const btn = e.target.closest("button");
+  if (!btn) return;
+  const id = btn.dataset.id;
+  try {
+    if (btn.dataset.act === "renew-one") {
+      await renewAccounts([id], { confirmMany: false });
+      return;
+    }
+    if (btn.dataset.act === "probe-one") {
+      await runAccountProbe(id);
+      return;
+    }
+    if (btn.dataset.act === "quota-one") {
+      setRowBusy(id, true, "查询中");
+      try {
+        const q = await api("/accounts/" + encodeURIComponent(id) + "/quota");
+        quotaCache[id] = q;
+        if (q.auto_disabled) toast("该账号额度已耗尽，已移出轮询", false);
+        else if (q.ok) toast((q.display && q.display.summary) || "额度已更新");
+        else toast(q.error || "额度查询失败", false);
+        upsertAccountInList({
+          id,
+          _pool: {
+            last_quota: q,
+            disabled_for_quota: !!q.auto_disabled || !!q.exhausted,
+          },
+        });
+        refreshOneAccountLocal(id);
+      } finally {
+        setRowBusy(id, false);
+      }
+      return;
+    }
+    if (btn.dataset.act === "toggle-acc") {
+      setRowBusy(id, true, "处理中");
+      try {
+        const en = btn.dataset.on === "1";
+        await api("/accounts/" + encodeURIComponent(id) + "/enabled", {
+          method: "PATCH",
+          body: JSON.stringify({ enabled: en }),
+        });
+        toast(en ? "已启用（重新加入轮询）" : "已禁用");
+        upsertAccountInList({ id, _pool: { enabled: en } });
+        refreshOneAccountLocal(id);
+      } finally {
+        setRowBusy(id, false);
+      }
+      return;
+    }
+    if (btn.dataset.act === "rm-acc") {
+      if (!confirm("确定移除此账号？将从数据库与本地镜像同步删除。")) return;
+      setRowBusy(id, true, "移除中");
+      try {
+        await api("/accounts/" + encodeURIComponent(id), { method: "DELETE" });
+        selectedAccountIds.delete(id);
+        accountsList = (accountsList || []).filter((a) => a.id !== id);
+        accountsTotal = Math.max(0, (accountsTotal || 1) - 1);
+        const row = document.querySelector(`tr[data-acc-id="${CSS.escape(String(id))}"]`);
+        if (row) row.remove();
+        if ($("acc-page-info")) {
+          $("acc-page-info").textContent = `${accountsPage} / ${Math.max(1, accountsTotalPages || 1)} (本页 ${document.querySelectorAll("#accounts-tbody tr[data-acc-id]").length} / 共 ${accountsTotal || 0} 个)`;
+        }
+        toast("已移除");
+      } finally {
+        setRowBusy(id, false);
+      }
+      return;
+    }
+  } catch (err) { toast(err.message, false); }
+});
+
+const bindQuota = (id) => { const el = $(id); if (el) el.onclick = () => refreshAllQuota(true); };
+bindQuota("btn-refresh-quota");
+bindQuota("btn-refresh-quota-2");
+const bindProbe = (id) => { const el = $(id); if (el) el.onclick = () => runProbeAll(); };
+bindProbe("btn-probe-all");
+bindProbe("btn-probe-all-2");
+
+on("btn-save-mode", "onclick", async () => {  try {
+    const mode = $("account-mode").value;
+    await api("/settings/account-mode", {
+      method: "PUT",
+      body: JSON.stringify({ mode }),
+    });
+    toast("轮询策略已保存: " + mode);
+    statusCache = await api("/status");
+    await loadDashboard();
+  } catch (e) { toast(e.message, false); }
+});
+
+
+
+async function importJsonFiles() {
+  const input = $("import-file");
+  const files = input && input.files;
+  if (!files || !files.length) return toast("请先选择 JSON 文件", false);
+  const merge = ($("import-merge") && $("import-merge").checked) ? "true" : "false";
+  const btn = $("btn-import");
+  if (btn) {
+    btn.disabled = true;
+    if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+    btn.textContent = files.length > 1 ? `导入中 0/${files.length}` : "导入中…";
+  }
+  try {
+    const fd = new FormData();
+    for (let i = 0; i < files.length; i++) fd.append("files", files[i]);
+    fd.append("merge", merge);
+    let r;
+    try {
+      r = await api("/accounts/import-files", { method: "POST", body: fd });
+    } catch (e) {
+      let totalImported = 0, totalFailed = 0, lastMessage = "";
+      for (let i = 0; i < files.length; i++) {
+        if (btn) btn.textContent = `导入中 ${i + 1}/${files.length}`;
+        const f = files[i];
+        try {
+          const one = new FormData();
+          one.append("file", f);
+          one.append("merge", merge);
+          const rr = await api("/accounts/import-file", { method: "POST", body: one });
+          totalImported += rr.imported?.length || rr.count || 0;
+          lastMessage = rr.message || `已导入 ${rr.imported?.length || 0} 个账号`;
+        } catch (err) {
+          totalFailed++;
+          toast(`${f.name}: ${err.message}`, false);
+        }
+      }
+      toast(files.length > 1 ? `批量导入完成：${totalImported} 账号，${totalFailed} 文件失败` : (lastMessage || `已导入 ${totalImported} 个账号`), totalFailed === 0);
+      if (input) input.value = "";
+      if ($("import-file-name")) $("import-file-name").textContent = "未选择文件";
+      try { await loadAccountsPage({ reset: true }); } catch (_) { await loadDashboard(); }
+      return;
+    }
+    const count = r.count || r.imported?.length || 0;
+    const parseErrors = r.parse_errors || 0;
+    toast(r.message || `导入完成：${count} 个账号` + (parseErrors ? `，${parseErrors} 个文件失败` : ""), parseErrors === 0);
+    if (input) input.value = "";
+    if ($("import-file-name")) $("import-file-name").textContent = "未选择文件";
+    try { await loadAccountsPage({ reset: true }); } catch (_) { await loadDashboard(); }
+  } catch (e) {
+    toast(e.message || "导入失败", false);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = btn.dataset.label || "导入文件";
+    }
+  }
+}
+
+async function importSsoCookies() {
+  const ta = $("sso-cookies");
+  const fileInput = $("sso-file");
+  let raw = ta && ta.value.trim();
+  if (!raw && fileInput && fileInput.files && fileInput.files[0]) {
+    try { raw = await fileInput.files[0].text(); }
+    catch (e) { return toast("读取文件失败: " + e.message, false); }
+  }
+  if (!raw) return toast("请粘贴 SSO cookie 或选择文件", false);
+  const lines = raw.split("\n").map(s => s.trim()).filter(Boolean);
+  if (!lines.length) return toast("请粘贴 SSO cookie 或选择文件", false);
+  const delay = parseInt(($("sso-delay") && $("sso-delay").value) || "0", 10) || 0;
+  const merge = !!($("sso-merge") && $("sso-merge").checked);
+  const btn = $("btn-import-sso");
+  if (btn) {
+    btn.disabled = true;
+    if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+    btn.textContent = `导入中 0/${lines.length}`;
+  }
+  setLogPanel("sso-result", `开始导入 ${lines.length} 条 SSO…\n并发转换中，请稍候`, { forceShow: true });
+  try {
+    // send progress-friendly max_workers; backend will cap
+    const r = await api("/accounts/import-sso", {
+      method: "POST",
+      body: JSON.stringify({
+        sso_cookies: lines,
+        merge,
+        delay,
+        max_workers: delay >= 2 ? 2 : 6,
+      }),
+    });
+    const rows = (r.results || []).map((x) => {
+      const ok = x.status === "ok";
+      const meta = ok ? `${x.email || x.user_id || ""} ${x.has_refresh_token ? "+refresh" : ""}` : (x.error || "");
+      return `[${x.index}] ${ok ? "✅" : "❌"} ${x.sso_hint || ""} ${meta}`;
+    });
+    setLogPanel("sso-result", `${r.message || ""}\n${rows.join("\n")}`, { forceShow: true });
+    toast(r.message || `SSO 导入完成：${r.success || 0}/${r.total || lines.length}`, !!r.ok);
+    if (ta) ta.value = "";
+    if (fileInput) fileInput.value = "";
+    if ($("sso-file-name")) $("sso-file-name").textContent = "未选择文件";
+    try { await loadAccountsPage({ reset: true }); } catch (_) { await loadDashboard(); }
+  } catch (e) {
+    setLogPanel("sso-result", "导入失败: " + (e.message || e), { forceShow: true });
+    toast(e.message || "SSO 导入失败", false);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = btn.dataset.label || "导入 SSO";
+    }
+  }
+}
+
+
+async function startDeviceLogin() {
+  const btn = $("btn-login-device");
+  if (btn) {
+    btn.disabled = true;
+    if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+    btn.textContent = "启动中…";
+  }
+  try {
+    const r = await api("/accounts/login", {
+      method: "POST",
+      body: JSON.stringify({ mode: "device", capture: true }),
+    });
+    // some backends return ok=false with error; others just return session fields
+    if (r && r.ok === false) {
+      toast(r.error || r.message || "启动失败", false);
+      setDeviceLoginIdle(true);
+      return;
+    }
+    if (!(r.session_id || r.id || r.user_code || r.device_code)) {
+      toast(r.error || r.message || "启动失败：未返回设备码会话", false);
+      setDeviceLoginIdle(true);
+      return;
+    }
+    showDeviceSession(r);
+    clearInterval(devicePollTimer);
+    devicePollTimer = setInterval(pollDeviceSession, 2500);
+    setTimeout(pollDeviceSession, 800);
+    setTimeout(pollDeviceSession, 2500);
+    const code = r.user_code || r.device_code || r.code;
+    toast(code ? ("设备码已生成: " + code) : (r.message || "已启动设备码登录"));
+  } catch (e) {
+    toast(e.message || "启动设备码登录失败", false);
+    setDeviceLoginIdle(true);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = btn.dataset.label || "开始设备码登录";
+    }
+  }
+}
+
+async function copyDeviceCode() {
+  const code = (($("device-code") && $("device-code").textContent) || "").trim();
+  if (!code || code === "—" || code === "····") {
+    toast("暂无设备码，请先开始设备码登录", false);
+    return;
+  }
+  const ok = await copyText(code);
+  toast(ok ? "已复制设备码" : code, ok);
+}
+
+function setDeviceLoginIdle(idle) {
+  const box = $("device-session");
+  if (box) box.dataset.deviceIdle = idle ? "1" : "0";
+  const poll = $("btn-poll-device");
+  const copy = $("btn-copy-device");
+  const hint = $("device-idle-hint");
+  const result = $("device-result");
+  if (poll) {
+    poll.disabled = !!idle;
+    poll.title = idle ? "请先开始设备码登录" : "刷新当前设备码会话";
+  }
+  if (copy) {
+    copy.disabled = !!idle;
+    copy.title = idle ? "请先开始设备码登录" : "复制设备码";
+  }
+  if (idle) {
+    if (result) { result.classList.add("hidden"); result.hidden = true; }
+    if (hint) { hint.classList.remove("hidden"); hint.hidden = false; }
+    if ($("device-status")) $("device-status").textContent = "未开始";
+    if ($("device-code")) $("device-code").textContent = "—";
+    if ($("device-url")) { $("device-url").textContent = "—"; $("device-url").removeAttribute("href"); }
+    setLogPanel("device-log", "", { forceShow: false });
+  } else {
+    if (result) { result.classList.remove("hidden"); result.hidden = false; }
+    if (hint) { hint.classList.add("hidden"); hint.hidden = true; }
+  }
+}
+
+function showDeviceSession(r) {
+  setDeviceLoginIdle(false);
+  showPanel("device-session");
+  loginSessionId = (r && (r.session_id || r.id)) || loginSessionId;
+  const code = r && (r.user_code || r.device_code || r.code);
+  if (code && $("device-code")) $("device-code").textContent = code;
+  const url = r && (r.verification_url || r.verification_uri || r.url);
+  if (url && $("device-url")) {
+    $("device-url").textContent = url;
+    $("device-url").href = url;
+  }
+  const st = ((r && (r.status || r.state)) || "running");
+  const msg = (r && (r.message || r.error)) || "";
+  if ($("device-status")) $("device-status").textContent = msg ? (st + " · " + msg) : st;
+  if (r && r.output_tail) setLogPanel("device-log", r.output_tail, { forceShow: true });
+  else if (msg) setLogPanel("device-log", msg, { forceShow: true });
+  // enable copy only when code exists
+  const copy = $("btn-copy-device");
+  if (copy) copy.disabled = !(code && String(code).trim() && String(code).trim() !== "—");
+  const poll = $("btn-poll-device");
+  if (poll) poll.disabled = !loginSessionId;
+}
+
+
+async function pollDeviceSession() {
+  if (!loginSessionId) {
+    toast("请先点击“开始设备码登录”", false);
+    setDeviceLoginIdle(true);
+    return;
+  }
+  const pollBtn = $("btn-poll-device");
+  if (pollBtn) {
+    pollBtn.disabled = true;
+    if (!pollBtn.dataset.label) pollBtn.dataset.label = pollBtn.textContent;
+    pollBtn.textContent = "刷新中…";
+  }
+  try {
+    const s = await api("/accounts/login/sessions/" + encodeURIComponent(loginSessionId));
+    showDeviceSession(s);
+    if (s.status === "success" || s.status === "completed" || s.status === "imported") {
+      toast("登录成功，账号已入库");
+      clearInterval(devicePollTimer);
+      devicePollTimer = null;
+      // only refresh accounts list page, not whole dashboard if possible
+      try { await loadAccountsPage({ reset: false }); } catch (_) { try { await loadDashboard(); } catch(__){} }
+    } else if (s.status === "error" || s.status === "failed" || s.status === "expired") {
+      toast(s.error || s.message || "登录失败", false);
+      clearInterval(devicePollTimer);
+      devicePollTimer = null;
+    }
+  } catch (e) {
+    toast((e && e.message) || "刷新设备码状态失败", false);
+  } finally {
+    if (pollBtn) {
+      pollBtn.textContent = pollBtn.dataset.label || "刷新状态";
+      pollBtn.disabled = !loginSessionId;
+    }
+  }
+}
+
+
+on("btn-login-device", "onclick", () => startDeviceLogin());
+on("btn-poll-device", "onclick", () => pollDeviceSession());
+on("btn-copy-device", "onclick", () => copyDeviceCode());
+
+if ($("import-file")) {
+  on("import-file", "onchange", () => {    const files = $("import-file").files;
+    const label = $("import-file-name");
+    if (label) {
+      if (!files || !files.length) {
+        label.textContent = "未选择文件";
+      } else if (files.length === 1) {
+        label.textContent = `已选择：${files[0].name}（${(files[0].size / 1024).toFixed(1)} KB）`;
+      } else {
+        const totalKb = Array.from(files).reduce((s, f) => s + f.size, 0) / 1024;
+        label.textContent = `已选择 ${files.length} 个文件（共 ${totalKb.toFixed(1)} KB）`;
+      }
+    }
+  });
+}
+on("btn-import", "onclick", () => importJsonFiles());
+on("btn-import-sso", "onclick", () => importSsoCookies());
+if ($("sso-file")) {
+  on("sso-file", "onchange", () => {    const f = $("sso-file").files && $("sso-file").files[0];
+    const label = $("sso-file-name");
+    if (label) {
+      label.textContent = f
+        ? `已选择：${f.name}（${(f.size / 1024).toFixed(1)} KB）`
+        : "未选择文件";
+    }
+  });
+}
+if ($("btn-export")) {
+  on("btn-export", "onclick", async () => {    try {
+      const res = await fetch("/admin/api/accounts/export?download=1", {
+        headers: headers(false),
+      });
+      if (!res.ok) {
+        let msg = res.statusText;
+        try {
+          const d = await res.json();
+          msg = d.detail || d.error || msg;
+        } catch {}
+        throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+      }
+      const blob = await res.blob();
+      const cd = res.headers.get("Content-Disposition") || "";
+      let filename = "grok2api-auth-export.json";
+      const m = /filename=\"?([^\";]+)\"?/.exec(cd);
+      if (m) filename = m[1];
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      toast("已导出 auth.json");
+    } catch (e) { toast(e.message, false); }
+  });
+}
+
+on("btn-refresh-acc", "onclick", async () => {  try {
+    statusCache = await api("/status");
+    await loadDashboard();
+    if (loginSessionId) await pollDeviceSession();
+    toast("已刷新");
+  } catch (e) { toast(e.message, false); }
+});
+on("btn-logout-cli", "onclick", async () => {  if (!confirm("注销全部 Grok 账号？（将清空数据库账号池与本地镜像）")) return;
+  try {
+    const r = await api("/accounts/logout", { method: "POST" });
+    toast(r.message || "完成", !!r.ok);
+    statusCache = await api("/status");
+    await loadDashboard();
+  } catch (e) { toast(e.message, false); }
+});
+
+
+
+/* ── System settings page ───────────────────────────── */
+function fillSystemSettingsForm(s) {
+  s = s || {};
+  if ($("set-account-mode") && s.account_mode) $("set-account-mode").value = s.account_mode;
+  if ($("set-default-model")) $("set-default-model").value = s.default_model || "";
+  if ($("set-token-maintain")) $("set-token-maintain").checked = s.token_maintain_enabled !== false;
+  if ($("set-model-health")) $("set-model-health").checked = s.model_health_enabled !== false;
+  if ($("set-affinity")) $("set-affinity").checked = s.conversation_affinity_enabled !== false;
+  if ($("set-reasoning") && s.reasoning_compat) $("set-reasoning").value = s.reasoning_compat;
+  if ($("set-max-tools")) $("set-max-tools").value = (s.outbound_max_tools != null ? s.outbound_max_tools : 1);
+  if ($("set-tool-gap")) $("set-tool-gap").value = (s.outbound_tool_gap_sec != null ? s.outbound_tool_gap_sec : 0.08);
+  if ($("set-sse-keepalive")) $("set-sse-keepalive").value = (s.sse_keepalive != null ? s.sse_keepalive : 8);
+  if ($("set-history-compact")) $("set-history-compact").checked = !!s.history_compact_enabled;
+  const pol = s.pool_policy || s;
+  if ($("set-cd-default") && pol.cooldown_default_sec != null) $("set-cd-default").value = pol.cooldown_default_sec;
+  if ($("set-cd-auth") && pol.cooldown_auth_sec != null) $("set-cd-auth").value = pol.cooldown_auth_sec;
+  if ($("set-cd-429") && pol.cooldown_rate_limit_sec != null) $("set-cd-429").value = pol.cooldown_rate_limit_sec;
+  if ($("set-cd-5xx") && pol.cooldown_server_error_sec != null) $("set-cd-5xx").value = pol.cooldown_server_error_sec;
+  if ($("set-cd-max") && pol.cooldown_max_sec != null) $("set-cd-max").value = pol.cooldown_max_sec;
+  if ($("set-soft-ttl") && pol.soft_model_block_ttl_sec != null) $("set-soft-ttl").value = pol.soft_model_block_ttl_sec;
+  if ($("set-durable-ttl") && pol.durable_model_block_ttl_sec != null) $("set-durable-ttl").value = pol.durable_model_block_ttl_sec;
+  if ($("set-probe-kick-streak") && pol.probe_fail_kick_streak != null) $("set-probe-kick-streak").value = pol.probe_fail_kick_streak;
+  if ($("set-probe-disable-streak") && pol.probe_fail_disable_streak != null) $("set-probe-disable-streak").value = pol.probe_fail_disable_streak;
+  if ($("set-probe-kick-cd") && pol.probe_kick_cooldown_sec != null) $("set-probe-kick-cd").value = pol.probe_kick_cooldown_sec;
+  if ($("set-max-failover") && pol.max_failover_attempts != null) $("set-max-failover").value = pol.max_failover_attempts;
+  const pill = $("pwd-env-pill");
+  if (pill) {
+    if (s.admin_password_from_env) {
+      pill.textContent = "环境变量密码生效";
+      pill.className = "g2a-tag g2a-tag-warn";
+    } else {
+      pill.textContent = s.has_admin_password ? "已设置密码" : "未设置";
+      pill.className = "g2a-tag";
+    }
+  }
+  const up = $("settings-updated-at");
+  if (up) {
+    up.textContent = s.updated_at
+      ? ("上次更新：" + (typeof fmtTime === "function" ? fmtTime(s.updated_at) : new Date(s.updated_at * 1000).toLocaleString()))
+      : "尚未通过管理台保存过设置";
+  }
+}
+
+async function loadSystemSettings(force) {
+  // Prefer dedicated endpoint; fall back to dashboard cache.
+  let s = null;
+  try {
+    const r = await api("/settings");
+    s = (r && r.settings) || r || null;
+  } catch (e) {
+    if (force) throw e;
+    s = (dashCache && dashCache.settings) || (statusCache && statusCache.settings) || null;
+  }
+  if (!s) return null;
+  if (dashCache) dashCache.settings = Object.assign({}, dashCache.settings || {}, s);
+  if (statusCache) statusCache.settings = Object.assign({}, statusCache.settings || {}, s);
+  fillSystemSettingsForm(s);
+  return s;
+}
+
+function collectSystemSettingsPatch() {
+  const patch = {};
+  if ($("set-account-mode")) patch.account_mode = $("set-account-mode").value;
+  if ($("set-default-model")) patch.default_model = ($("set-default-model").value || "").trim();
+  if ($("set-token-maintain")) patch.token_maintain_enabled = !!$("set-token-maintain").checked;
+  if ($("set-model-health")) patch.model_health_enabled = !!$("set-model-health").checked;
+  if ($("set-affinity")) patch.conversation_affinity_enabled = !!$("set-affinity").checked;
+  if ($("set-reasoning")) patch.reasoning_compat = $("set-reasoning").value;
+  if ($("set-max-tools") && $("set-max-tools").value !== "") {
+    patch.outbound_max_tools = Number($("set-max-tools").value);
+  }
+  if ($("set-tool-gap") && $("set-tool-gap").value !== "") {
+    patch.outbound_tool_gap_sec = Number($("set-tool-gap").value);
+  }
+  if ($("set-sse-keepalive") && $("set-sse-keepalive").value !== "") {
+    patch.sse_keepalive = Number($("set-sse-keepalive").value);
+  }
+  if ($("set-history-compact")) patch.history_compact_enabled = !!$("set-history-compact").checked;
+  if ($("set-cd-default") && $("set-cd-default").value !== "") patch.cooldown_default_sec = Number($("set-cd-default").value);
+  if ($("set-cd-auth") && $("set-cd-auth").value !== "") patch.cooldown_auth_sec = Number($("set-cd-auth").value);
+  if ($("set-cd-429") && $("set-cd-429").value !== "") patch.cooldown_rate_limit_sec = Number($("set-cd-429").value);
+  if ($("set-cd-5xx") && $("set-cd-5xx").value !== "") patch.cooldown_server_error_sec = Number($("set-cd-5xx").value);
+  if ($("set-cd-max") && $("set-cd-max").value !== "") patch.cooldown_max_sec = Number($("set-cd-max").value);
+  if ($("set-soft-ttl") && $("set-soft-ttl").value !== "") patch.soft_model_block_ttl_sec = Number($("set-soft-ttl").value);
+  if ($("set-durable-ttl") && $("set-durable-ttl").value !== "") patch.durable_model_block_ttl_sec = Number($("set-durable-ttl").value);
+  if ($("set-probe-kick-streak") && $("set-probe-kick-streak").value !== "") patch.probe_fail_kick_streak = Number($("set-probe-kick-streak").value);
+  if ($("set-probe-disable-streak") && $("set-probe-disable-streak").value !== "") patch.probe_fail_disable_streak = Number($("set-probe-disable-streak").value);
+  if ($("set-probe-kick-cd") && $("set-probe-kick-cd").value !== "") patch.probe_kick_cooldown_sec = Number($("set-probe-kick-cd").value);
+  if ($("set-max-failover") && $("set-max-failover").value !== "") patch.max_failover_attempts = Number($("set-max-failover").value);
+  return patch;
+}
+
+async function saveSystemSettings() {
+  const btn = $("btn-save-settings");
+  if (btn) btn.disabled = true;
+  try {
+    const patch = collectSystemSettingsPatch();
+    if (patch.outbound_max_tools != null && (Number.isNaN(patch.outbound_max_tools) || patch.outbound_max_tools < 0)) {
+      throw new Error("每轮工具数无效");
+    }
+    if (patch.outbound_tool_gap_sec != null && (Number.isNaN(patch.outbound_tool_gap_sec) || patch.outbound_tool_gap_sec < 0)) {
+      throw new Error("工具间隔无效");
+    }
+    const r = await api("/settings", { method: "PUT", body: JSON.stringify(patch) });
+    const s = (r && r.settings) || patch;
+    if (dashCache) dashCache.settings = Object.assign({}, dashCache.settings || {}, s);
+    if (statusCache) statusCache.settings = Object.assign({}, statusCache.settings || {}, s);
+    fillSystemSettingsForm(s);
+    try { await refreshOverviewStatus({ force: true, render: true }); } catch (_) {}
+    toast("设置已保存");
+    try { await loadDashboard(); } catch (_) {}
+    return s;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function changeAdminPassword() {
+  const cur = ($("set-cur-password") && $("set-cur-password").value) || "";
+  const nw = ($("set-new-password") && $("set-new-password").value) || "";
+  const cf = ($("set-confirm-password") && $("set-confirm-password").value) || "";
+  if (!cur) throw new Error("请输入当前密码");
+  if (!nw || nw.length < 4) throw new Error("新密码至少 4 位");
+  if (nw !== cf) throw new Error("两次输入的新密码不一致");
+  const btn = $("btn-change-password");
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api("/settings/password", {
+      method: "PUT",
+      body: JSON.stringify({
+        current_password: cur,
+        new_password: nw,
+        confirm_password: cf,
+      }),
+    });
+    if ($("set-cur-password")) $("set-cur-password").value = "";
+    if ($("set-new-password")) $("set-new-password").value = "";
+    if ($("set-confirm-password")) $("set-confirm-password").value = "";
+    if (r && r.settings) fillSystemSettingsForm(r.settings);
+    toast(r.message || "密码已更新");
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+
+async function setFeatureToggle(path, enabled, label) {
+  try {
+    const r = await api(path, {
+      method: "PUT",
+      body: JSON.stringify({ enabled: !!enabled }),
+    });
+    toast((label || "设置") + (enabled ? " 已开启" : " 已关闭"));
+    statusCache = statusCache || {};
+    dashCache = dashCache || {};
+    statusCache.settings = statusCache.settings || {};
+    dashCache.settings = dashCache.settings || {};
+    if (path.indexOf("token-maintain") >= 0) {
+      statusCache.settings.token_maintain_enabled = !!enabled;
+      dashCache.settings.token_maintain_enabled = !!enabled;
+    }
+    if (path.indexOf("model-health") >= 0) {
+      statusCache.settings.model_health_enabled = !!enabled;
+      dashCache.settings.model_health_enabled = !!enabled;
+    }
+    // Prefer fields returned by toggle API immediately.
+    if (r && r.maintainer) {
+      statusCache.token_maintainer = r.maintainer;
+      dashCache.token_maintainer = r.maintainer;
+    }
+    if (r && r.model_health) {
+      statusCache.model_health = r.model_health;
+      dashCache.model_health = r.model_health;
+    }
+    if (r && r.settings) {
+      statusCache.settings = Object.assign({}, statusCache.settings, r.settings);
+      dashCache.settings = Object.assign({}, dashCache.settings, r.settings);
+    }
+    try { renderMaintainer(); } catch (_) {}
+    try { renderModelHealthInfo(); } catch (_) {}
+    try { await refreshOverviewStatus({ force: true, render: true }); } catch (_) {}
+  } catch (e) {
+    toast(e.message || "切换失败", false);
+    try { await refreshOverviewStatus({ force: true, render: true }); } catch (_) {
+      try { renderMaintainer(); } catch (_) {}
+      try { renderModelHealthInfo(); } catch (_) {}
+    }
+  }
+}
+
+if ($("chk-token-maintain")) {
+  $("chk-token-maintain").onchange = () => setFeatureToggle(
+    "/settings/token-maintain",
+    !!$("chk-token-maintain").checked,
+    "Token 自动续期"
+  );
+}
+if ($("chk-model-health")) {
+  $("chk-model-health").onchange = () => setFeatureToggle(
+    "/settings/model-health",
+    !!$("chk-model-health").checked,
+    "自动健康探测"
+  );
+}
+
+on("btn-refresh-tokens", "onclick", async () => {  try {
+    if ($("btn-refresh-tokens")) $("btn-refresh-tokens").disabled = true;
+    const r = await api("/accounts/refresh", {
+      method: "POST",
+      body: JSON.stringify({ force: true }),
+    });
+    const n = r.refreshed ?? (r.results || []).filter(x => x.ok && !x.skipped).length;
+    const lines = (r.results || [])
+      .filter(x => x.ok && !x.skipped)
+      .map(x => `${x.email || x.id}: 新过期 ${fmtTime(x.expires_at)} (剩余 ${fmtRemaining(x.expires_at)})`);
+    toast(`Token 已刷新：${n} 个账号` + (lines.length ? " · " + lines[0] : ""));
+    statusCache = await api("/status");
+    await loadDashboard();
+  } catch (e) { toast(e.message, false); }
+  finally { if ($("btn-refresh-tokens")) $("btn-refresh-tokens").disabled = false; }
+});
+on("btn-normalize-keys", "onclick", async () => {  try {
+    const r = await api("/accounts/normalize", { method: "POST" });
+    toast(`多账号键规范化：变更 ${r.changed ?? 0}，共 ${r.total ?? 0} 个`);
+    statusCache = await api("/status");
+    await loadDashboard();
+  } catch (e) { toast(e.message, false); }
+});
+
+if ($("btn-sync-models")) {
+  on("btn-sync-models", "onclick", async () => {    try {
+      const r = await api("/models/sync", { method: "POST" });
+      toast(`已同步 ${r.count || 0} 个模型`);
+      statusCache = await api("/status");
+      await loadDashboard();
+    } catch (e) { toast(e.message, false); }
+  });
+}
+
+if ($("btn-start-reg")) {
+  on("btn-start-reg", "onclick", async () => {
+    try {
+      const config = readRegConfig();
+      cacheRegConfigLocal(config);
+      if ($("btn-start-reg")) $("btn-start-reg").disabled = true;
+      const r = await api("/accounts/register-email", {
+        method: "POST",
+        body: JSON.stringify(buildRegBody(config)),
+      });
+      // Batch multi-thread response
+      if (r.batch || (Array.isArray(r.session_ids) && r.session_ids.length > 1) || (Array.isArray(r.sessions) && r.sessions.length > 1)) {
+        regSessionIds = Array.isArray(r.session_ids) && r.session_ids.length
+          ? r.session_ids.slice()
+          : (Array.isArray(r.sessions) ? r.sessions.map(s => s.id || s.session_id).filter(Boolean) : []);
+        regSessionId = regSessionIds[0] || r.id || r.session_id || null;
+        if (Array.isArray(r.sessions) && r.sessions.length) {
+          showRegSessionGroup(r.sessions);
+        } else {
+          showRegSessionGroup(regSessionIds.map(id => ({ id, status: "starting" })));
+        }
+        $("reg-session-box").classList.remove("hidden");
+        $("reg-email").textContent = `批量注册 × ${r.count || regSessionIds.length || "?"}`;
+        $("reg-status").textContent = r.message || `concurrency=${r.concurrency || "?"} · batch=${r.batch_id || "—"}`;
+        toast(`已启动批量注册：${r.count || regSessionIds.length} 个 / 并发 ${r.concurrency || "?"}`);
+      } else {
+        regSessionId = r.id || r.session_id || null;
+        regSessionIds = regSessionId ? [regSessionId] : [];
+        showRegSession(r);
+        toast(r.email ? ("已启动: " + r.email) : "已启动邮箱注册");
+      }
+      // Server auto-saves config on start — resync form from DB
+      setTimeout(() => { loadRegConfig(true).catch(() => {}); }, 300);
+      clearInterval(regPollTimer);
+      regPollTimer = setInterval(pollRegSession, 2500);
+      setTimeout(pollRegSession, 800);
+      // Batch may still be spawning — refresh ids shortly after
+      if (r.batch_id) {
+        setTimeout(async () => {
+          try {
+            const b = await api("/accounts/register-email/batches/" + encodeURIComponent(r.batch_id));
+            if (Array.isArray(b.session_ids) && b.session_ids.length) {
+              regSessionIds = b.session_ids.slice();
+              regSessionId = regSessionIds[0];
+            }
+            if (Array.isArray(b.sessions) && b.sessions.length) showRegSessionGroup(b.sessions);
+          } catch (_) {}
+        }, 1500);
+      }
+    } catch (e) {
+      toast(e.message, false);
+    } finally {
+      if ($("btn-start-reg")) $("btn-start-reg").disabled = false;
+    }
+  });
+}
+if ($("btn-test-reg-proxy")) {
+  on("btn-test-reg-proxy", "onclick", async () => {
+    try {
+      if ($("btn-test-reg-proxy")) $("btn-test-reg-proxy").disabled = true;
+      const r = await api("/register-email/test-proxy", {
+        method: "POST",
+        body: JSON.stringify(buildProxyTestBody(readRegConfig())),
+      });
+      showPanel("reg-session-box");
+      if ($("reg-email")) $("reg-email").textContent = "xAI 代理测试";
+      if ($("reg-status")) $("reg-status").textContent = r.ok ? "代理可用" : "代理不可用";
+      setLogPanel("reg-log", JSON.stringify(r, null, 2), { forceShow: true });
+      toast(r.ok ? "代理测试通过" : "代理测试失败", !!r.ok);
+    } catch (e) {
+      toast(e.message, false);
+    } finally {
+      if ($("btn-test-reg-proxy")) $("btn-test-reg-proxy").disabled = false;
+    }
+  });
+}
+if ($("btn-save-reg")) {
+  on("btn-save-reg", "onclick", () => { saveRegConfig().catch(() => {}); });
+}
+if ($("btn-refresh-reg")) {
+  on("btn-refresh-reg", "onclick", () => pollRegSession());
+}
+
+
+
+  window.addEventListener("pagehide", () => {
+    try { if (devicePollTimer) clearInterval(devicePollTimer); } catch(_){}
+    try { if (regPollTimer) clearInterval(regPollTimer); } catch(_){}
+    try { if (uiRefreshTimer) clearInterval(uiRefreshTimer); } catch(_){}
+  });
+  [["btn-probe-all","btn-probe-all-2"],["btn-refresh-quota","btn-refresh-quota-2"]].forEach(([main,alt]) => {
+    if (!$(main) && $(alt)) { try { $(alt).id = main; } catch(_){ } }
+  });
+  
+/* ── Admin operation logs ───────────────────────────── */
+let logsPage = 1;
+let logsPageSize = 50;
+let logsTotalPages = 1;
+let logsLoading = false;
+let logsLoadSeq = 0;
+
+function bindLogsControls() {
+  on("btn-logs-search", "onclick", () => loadAdminLogs({ reset: true }));
+  on("btn-logs-reload", "onclick", () => loadAdminLogs({ reset: false }));
+  on("logs-page-prev", "onclick", () => {
+    if (logsPage > 1 && !logsLoading) { logsPage -= 1; loadAdminLogs(); }
+  });
+  on("logs-page-next", "onclick", () => {
+    if (!logsLoading && logsPage < logsTotalPages) { logsPage += 1; loadAdminLogs(); }
+  });
+  const q = $("logs-q");
+  if (q && !q._logsBound) {
+    q._logsBound = true;
+    q.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") loadAdminLogs({ reset: true });
+    });
+  }
+  const act = $("logs-action");
+  if (act && !act._logsBound) {
+    act._logsBound = true;
+    act.addEventListener("change", () => loadAdminLogs({ reset: true }));
+  }
+  const ps = $("logs-page-size");
+  if (ps && !ps._logsBound) {
+    ps._logsBound = true;
+    ps.addEventListener("change", () => loadAdminLogs({ reset: true }));
+  }
+  const tb = $("logs-tbody");
+  if (tb && !tb._logsBound) {
+    tb._logsBound = true;
+    tb.addEventListener("click", (e) => {
+      const tr = e.target.closest("tr[data-log-detail]");
+      if (!tr) return;
+      try {
+        const detail = JSON.parse(tr.getAttribute("data-log-detail") || "{}");
+        setLogPanel("logs-detail", JSON.stringify(detail, null, 2), { forceShow: true });
+      } catch (_) {}
+    });
+  }
+}
+
+async function ensureLogActions() {
+  const sel = $("logs-action");
+  if (!sel || sel.options.length > 1) return;
+  try {
+    const r = await api("/logs/actions");
+    const actions = (r && r.actions) || [];
+    actions.forEach((a) => {
+      const opt = document.createElement("option");
+      opt.value = a;
+      opt.textContent = a;
+      sel.appendChild(opt);
+    });
+  } catch (_) {}
+}
+
+async function loadAdminLogs({ reset = false } = {}) {
+  if (!$("logs-tbody")) return;
+  bindLogsControls();
+  await ensureLogActions();
+  if (reset) logsPage = 1;
+  logsLoading = true;
+  const seq = ++logsLoadSeq;
+  const q = ($("logs-q") && $("logs-q").value || "").trim();
+  const action = ($("logs-action") && $("logs-action").value) || "all";
+  logsPageSize = parseInt(($("logs-page-size") && $("logs-page-size").value) || "50", 10) || 50;
+  $("logs-tbody").innerHTML = `<tr><td colspan="6" class="g2a-muted">加载日志中…</td></tr>`;
+  if ($("logs-info")) $("logs-info").textContent = "查询中…";
+  try {
+    const data = await api(
+      `/logs?page=${encodeURIComponent(logsPage)}&page_size=${encodeURIComponent(logsPageSize)}&q=${encodeURIComponent(q)}&action=${encodeURIComponent(action)}`
+    );
+    if (seq !== logsLoadSeq) return;
+    const items = (data && data.items) || [];
+    logsTotalPages = Number(data.total_pages || 1) || 1;
+    logsPage = Number(data.page || logsPage) || 1;
+    if ($("logs-info")) {
+      $("logs-info").textContent = `共 ${data.total ?? items.length} 条 · 数据源 ${data.store_source || "postgres"} · 点击行查看详情`;
+    }
+    if ($("logs-page-info")) {
+      $("logs-page-info").textContent = `${logsPage} / ${logsTotalPages}`;
+    }
+    if ($("logs-page-prev")) $("logs-page-prev").disabled = logsPage <= 1;
+    if ($("logs-page-next")) $("logs-page-next").disabled = logsPage >= logsTotalPages;
+    if (!items.length) {
+      $("logs-tbody").innerHTML = `<tr><td colspan="6" class="g2a-muted">暂无日志</td></tr>`;
+    } else {
+      $("logs-tbody").innerHTML = items.map((it) => {
+        const detail = esc(JSON.stringify(it.detail || {}));
+        const target = [it.target_type, it.target_id].filter(Boolean).join(": ");
+        return `<tr data-log-detail='${detail.replace(/'/g, "&#39;")}' style="cursor:pointer">
+          <td class="g2a-muted">${esc(fmtTime(it.created_at))}</td>
+          <td class="mono">${esc(it.action || "—")}</td>
+          <td>${esc(it.summary || "—")}</td>
+          <td class="mono g2a-muted">${esc(target || "—")}</td>
+          <td class="g2a-muted">${esc(it.ip || "—")}</td>
+          <td>${it.ok === false ? '<span class="g2a-tag bad">失败</span>' : '<span class="g2a-tag ok">成功</span>'}</td>
+        </tr>`;
+      }).join("");
+    }
+  } catch (e) {
+    if (seq !== logsLoadSeq) return;
+    $("logs-tbody").innerHTML = `<tr><td colspan="6" class="g2a-muted">加载失败：${esc(e.message || e)}</td></tr>`;
+    toast(e.message || "加载日志失败", false);
+  } finally {
+    if (seq === logsLoadSeq) logsLoading = false;
+  }
+}
+
+
+window.G2AAdmin = { bootstrap, loadDashboard, api, $, toast, PAGE_META, renderAccounts, renderKeys };
+  if (document.body && document.body.dataset.page) {
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", () => bootstrap());
+    else bootstrap();
+  }
+})();

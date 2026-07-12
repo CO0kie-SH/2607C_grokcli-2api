@@ -38,9 +38,24 @@ def _mask_token(token: str | None) -> str:
     return token[:6] + "..." + token[-4:]
 
 
+def _accounts_store_source() -> str:
+    """Where list/status currently reads from: postgres | file."""
+    try:
+        from auth_store import _pg_accounts
+
+        if _pg_accounts() is not None:
+            return "postgres"
+    except Exception:
+        pass
+    return "file"
+
+
 def list_accounts() -> list[dict[str, Any]]:
-    """List all session entries in auth.json (no full tokens)."""
-    data = read_auth_map()
+    """List all session entries from durable store (PostgreSQL when enabled).
+
+    No full tokens are returned — only admin-safe fields.
+    """
+    data = read_auth_map()  # PG-first via auth_store
     if not data:
         return []
 
@@ -82,31 +97,53 @@ def account_status(*, include_accounts: bool = True) -> dict[str, Any]:
 
     `include_accounts=False` returns counts only — used by frequent /status polls
     so a 400+ account list is not re-serialized on every heartbeat.
+    Data source is PostgreSQL when hybrid/store backend is enabled.
     """
+    source = _accounts_store_source()
     if include_accounts:
         all_accounts = list_accounts()
         active = [a for a in all_accounts if not a.get("expired")]
         account_count = len(all_accounts)
         active_count = len(active)
     else:
-        # Cheap path: count from auth map without building admin row objects.
-        data = read_auth_map()
-        now = time.time()
+        # Cheap path: prefer SQL counts on PostgreSQL; avoid loading full payloads.
         account_count = 0
         active_count = 0
-        for entry in data.values():
-            if not isinstance(entry, dict):
-                continue
-            token = entry.get("key") or entry.get("access_token") or entry.get("token")
-            if not token:
-                continue
-            account_count += 1
-            exp_f = parse_expires_at(
-                entry.get("expires_at"), token if isinstance(token, str) else None
-            )
-            if exp_f is None or now < exp_f:
-                active_count += 1
         all_accounts = []
+        used_sql = False
+        try:
+            from store.accounts_pg import enabled as pg_on, count_accounts
+            from store.pg import connection
+
+            if pg_on():
+                account_count = int(count_accounts())
+                with connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT COUNT(*) FROM accounts
+                            WHERE expires_at IS NULL OR expires_at > now()
+                            """
+                        )
+                        active_count = int((cur.fetchone() or [0])[0] or 0)
+                used_sql = True
+        except Exception:
+            used_sql = False
+        if not used_sql:
+            data = read_auth_map()
+            now = time.time()
+            for entry in data.values():
+                if not isinstance(entry, dict):
+                    continue
+                token = entry.get("key") or entry.get("access_token") or entry.get("token")
+                if not token:
+                    continue
+                account_count += 1
+                exp_f = parse_expires_at(
+                    entry.get("expires_at"), token if isinstance(token, str) else None
+                )
+                if exp_f is None or now < exp_f:
+                    active_count += 1
     try:
         from settings_store import get_account_mode
 
@@ -114,8 +151,11 @@ def account_status(*, include_accounts: bool = True) -> dict[str, Any]:
     except Exception:
         mode = "round_robin"
     out = {
+        "store_source": source,
+        "store_backend": "postgres" if source == "postgres" else "file",
         "auth_file": str(AUTH_FILE),
         "auth_file_exists": AUTH_FILE.is_file(),
+        "auth_file_role": "mirror" if source == "postgres" else "primary",
         "logged_in": bool(active_count),
         "account_count": account_count,
         "active_count": active_count,
@@ -153,24 +193,71 @@ def _resolve_account_key(data: dict, account_id: str) -> str | None:
     return None
 
 
-def remove_account(account_id: str) -> bool:
-    data = read_auth_map()
-    matched = _resolve_account_key(data, account_id)
-    if matched is None:
-        return False
+def _cleanup_account_side_state(account_ids: list[str]) -> None:
+    """Clear pool meta + redis cooldown for deleted account ids (best-effort)."""
+    ids = [str(x).strip() for x in (account_ids or []) if str(x).strip()]
+    if not ids:
+        return
+    try:
+        from settings_store import get_account_pool_state, save_account_pool_state
+
+        state = get_account_pool_state()
+        changed = False
+        for aid in ids:
+            if aid in state:
+                state.pop(aid, None)
+                changed = True
+        if changed:
+            save_account_pool_state(state)
+    except Exception:
+        pass
+    for aid in ids:
+        try:
+            from store.pool_redis import clear_cooldown
+
+            clear_cooldown(aid)
+        except Exception:
+            pass
+        # stats hash if present
+        try:
+            from store.redis_client import delete, key, redis_enabled
+
+            if redis_enabled():
+                delete(key("stats", aid), key("cooldown", aid))
+        except Exception:
+            pass
+    try:
+        from account_pool import invalidate_pool_summary_cache
+
+        invalidate_pool_summary_cache()
+    except Exception:
+        pass
+
+
+def _backup_auth_file() -> None:
     if AUTH_FILE.is_file():
         backup = AUTH_FILE.with_suffix(f".bak.{int(time.time())}")
         try:
             shutil.copy2(AUTH_FILE, backup)
         except OSError:
             pass
+
+
+def remove_account(account_id: str) -> bool:
+    """Delete one account from durable store (PostgreSQL when enabled) + side state."""
+    data = read_auth_map()
+    matched = _resolve_account_key(data, account_id)
+    if matched is None:
+        return False
+    _backup_auth_file()
     del data[matched]
-    write_auth_map(data)
+    write_auth_map(data)  # PG primary + file mirror
+    _cleanup_account_side_state([matched, account_id])
     return True
 
 
 def remove_accounts(account_ids: list[str]) -> dict:
-    """Remove many accounts with a single auth.json rewrite."""
+    """Remove many accounts from durable store (PG/file) in one rewrite."""
     data = read_auth_map()
     removed: list[str] = []
     missing: list[str] = []
@@ -187,13 +274,9 @@ def remove_accounts(account_ids: list[str]) -> dict:
         del data[matched]
         removed.append(matched)
     if removed:
-        if AUTH_FILE.is_file():
-            backup = AUTH_FILE.with_suffix(f".bak.{int(time.time())}")
-            try:
-                shutil.copy2(AUTH_FILE, backup)
-            except OSError:
-                pass
-        write_auth_map(data)
+        _backup_auth_file()
+        write_auth_map(data)  # PG primary + file mirror
+        _cleanup_account_side_state(removed)
     return {
         "removed": removed,
         "missing": missing,
@@ -204,15 +287,60 @@ def remove_accounts(account_ids: list[str]) -> dict:
 
 
 def clear_all_accounts() -> bool:
-    if not AUTH_FILE.is_file():
-        return True
-    backup = AUTH_FILE.with_suffix(f".bak.{int(time.time())}")
+    """Clear every account from durable store (PostgreSQL + local file mirror)."""
+    _backup_auth_file()
     try:
-        shutil.copy2(AUTH_FILE, backup)
-        AUTH_FILE.unlink()
-        return True
+        # Empty map → PG write_auth_map deletes all account + pool rows.
+        write_auth_map({})
+    except Exception:
+        # Fallback: try file-only wipe
+        try:
+            if AUTH_FILE.is_file():
+                AUTH_FILE.unlink()
+        except OSError:
+            return False
+    # Extra safety: direct PG wipe if write path partially failed
+    try:
+        from store.accounts_pg import enabled as pg_on, write_auth_map as pg_write
+
+        if pg_on():
+            pg_write({})
+    except Exception:
+        pass
+    try:
+        from settings_store import save_account_pool_state
+
+        save_account_pool_state({})
+    except Exception:
+        pass
+    # Best-effort: wipe redis cooldown/stats keys is expensive; clear known pool ids only.
+    try:
+        from store.redis_client import delete, key, redis_enabled, get_client
+
+        if redis_enabled():
+            c = get_client()
+            if c is not None:
+                for pattern in (key("cooldown", "*"), key("stats", "*")):
+                    try:
+                        for k in c.scan_iter(match=pattern, count=200):
+                            delete(k)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    try:
+        from account_pool import invalidate_pool_summary_cache
+
+        invalidate_pool_summary_cache()
+    except Exception:
+        pass
+    # Keep empty local file for tools that still look at AUTH_FILE
+    try:
+        AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+        AUTH_FILE.write_text("{}", encoding="utf-8")
     except OSError:
-        return False
+        pass
+    return True
 
 
 def get_login_session(session_id: str) -> dict[str, Any] | None:
@@ -264,11 +392,11 @@ def start_login(mode: str = "device", *, capture: bool | None = None) -> dict[st
 
 
 def run_logout() -> dict[str, Any]:
-    """Clear local auth.json (no external CLI)."""
+    """Clear all accounts from durable store (PostgreSQL + local mirror)."""
     ok = clear_all_accounts()
     return {
         "ok": ok,
-        "message": "已清除本地 auth.json" if ok else "清除 auth.json 失败",
+        "message": "已清空数据库账号池与本地镜像" if ok else "清空账号池失败",
     }
 
 
@@ -400,6 +528,229 @@ def export_auth_payload(
     if wanted is not None:
         result["selected"] = len(wanted)
         result["missing"] = sorted(wanted - set(out.keys()))
+    return result
+
+
+
+def collect_normalized_entries(raw: str | dict[str, Any]) -> dict[str, Any]:
+    """Parse import payload into normalized account map without writing storage."""
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return {"ok": False, "error": "empty payload"}
+        if text.startswith("{"):
+            try:
+                parsed: Any = json.loads(text)
+            except json.JSONDecodeError as e:
+                return {"ok": False, "error": f"invalid JSON: {e}"}
+        else:
+            parsed = {"key": text}
+    else:
+        parsed = raw
+
+    if not isinstance(parsed, dict):
+        return {"ok": False, "error": "payload must be object or JWT string"}
+
+    # Unwrap export format
+    if (
+        "auth" in parsed
+        and isinstance(parsed.get("auth"), dict)
+        and "key" not in parsed
+        and "access_token" not in parsed
+        and "token" not in parsed
+    ):
+        auth_map = parsed["auth"]
+        if not auth_map:
+            return {"ok": True, "normalized": {}}
+        if all(isinstance(v, dict) for v in auth_map.values()):
+            parsed = auth_map
+
+    raw_entries: list[tuple[str | None, dict[str, Any]]] = []
+    looks_like_map = False
+    if parsed and all(isinstance(v, dict) for v in parsed.values()):
+        sample_vals = list(parsed.values())
+        if sample_vals and any(
+            "key" in v or "access_token" in v or "token" in v
+            for v in sample_vals
+            if isinstance(v, dict)
+        ):
+            if any(
+                ("auth.x.ai" in str(k))
+                or ("accounts.x.ai" in str(k))
+                or ("::" in str(k))
+                for k in parsed.keys()
+            ):
+                looks_like_map = True
+            elif (
+                "key" not in parsed
+                and "access_token" not in parsed
+                and "token" not in parsed
+            ):
+                looks_like_map = True
+
+    if looks_like_map:
+        for k, v in parsed.items():
+            if isinstance(v, dict) and (
+                v.get("key") or v.get("access_token") or v.get("token")
+            ):
+                raw_entries.append((str(k), dict(v)))
+    else:
+        token = (
+            parsed.get("key")
+            or parsed.get("token")
+            or parsed.get("access_token")
+            or parsed.get("accessToken")
+        )
+        if not token or not isinstance(token, str):
+            return {
+                "ok": False,
+                "error": "missing token/key. Provide JWT or auth.json entry.",
+            }
+        account_id = (
+            parsed.get("account_id") or parsed.get("id") or parsed.get("auth_key")
+        )
+        entry: dict[str, Any] = {
+            "key": token,
+            "auth_mode": parsed.get("auth_mode") or "imported",
+            "create_time": parsed.get("create_time")
+            or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        if parsed.get("expires_at") is not None:
+            entry["expires_at"] = parsed["expires_at"]
+        if parsed.get("refresh_token"):
+            entry["refresh_token"] = parsed["refresh_token"]
+        for field in (
+            "email",
+            "user_id",
+            "team_id",
+            "first_name",
+            "last_name",
+            "principal_type",
+            "oidc_client_id",
+        ):
+            if parsed.get(field) is not None:
+                entry[field] = parsed[field]
+        raw_entries.append((str(account_id) if account_id else None, entry))
+
+    if not raw_entries:
+        return {"ok": False, "error": "no valid account entries found"}
+
+    normalized: dict[str, dict[str, Any]] = {}
+    for pref_id, ent in raw_entries:
+        try:
+            aid, nent = _normalize_entry(ent, preferred_id=pref_id)
+        except ValueError:
+            continue
+        normalized[aid] = nent
+    if not normalized:
+        return {"ok": False, "error": "entries missing token"}
+    return {"ok": True, "normalized": normalized}
+
+
+def merge_normalized_accounts(
+    normalized: dict[str, dict[str, Any]], *, merge: bool = True
+) -> dict[str, Any]:
+    """Write normalized accounts once (single read/modify/write)."""
+    if not normalized:
+        return {
+            "ok": False,
+            "error": "no valid account entries found",
+            "imported": [],
+            "total_accounts": len(read_auth_map()) if AUTH_FILE.is_file() else 0,
+        }
+
+    existing: dict[str, Any] = {}
+    if merge:
+        existing = read_auth_map()
+        if AUTH_FILE.is_file():
+            backup = AUTH_FILE.with_suffix(f".bak.{int(time.time())}")
+            try:
+                shutil.copy2(AUTH_FILE, backup)
+            except OSError:
+                pass
+            try:
+                normalize_auth_file_keys()
+                existing = read_auth_map()
+            except Exception:
+                pass
+        for aid, nent in normalized.items():
+            uid = nent.get("user_id")
+            if not uid:
+                continue
+            for k in list(existing.keys()):
+                v = existing.get(k)
+                if not isinstance(v, dict):
+                    continue
+                if str(v.get("user_id") or v.get("principal_id") or "") == str(uid) and k != aid:
+                    existing.pop(k, None)
+        existing.update(normalized)
+        write_auth_map(existing)
+        total = len(existing)
+    else:
+        write_auth_map(normalized)
+        total = len(normalized)
+
+    imported = [
+        {
+            "id": aid,
+            "email": nent.get("email"),
+            "user_id": nent.get("user_id"),
+            "expires_at": nent.get("expires_at"),
+            "has_refresh_token": bool(nent.get("refresh_token")),
+        }
+        for aid, nent in normalized.items()
+    ]
+    return {
+        "ok": True,
+        "message": f"已导入 {len(imported)} 个账号",
+        "imported": imported,
+        "count": len(imported),
+        "auth_file": str(AUTH_FILE),
+        "total_accounts": total,
+        "merged": bool(merge),
+    }
+
+
+def import_auth_payloads_bulk(
+    payloads: list[Any], *, merge: bool = True
+) -> dict[str, Any]:
+    """Import many JSON payloads with one storage write."""
+    if not payloads:
+        return {"ok": False, "error": "empty payloads", "imported": [], "files": 0}
+
+    normalized: dict[str, dict[str, Any]] = {}
+    file_results: list[dict[str, Any]] = []
+    parse_errors = 0
+    for idx, raw in enumerate(payloads, 1):
+        dry = collect_normalized_entries(raw)
+        if not dry.get("ok"):
+            parse_errors += 1
+            file_results.append({"index": idx, "ok": False, "error": dry.get("error") or "parse failed"})
+            continue
+        entries = dry.get("normalized") or {}
+        normalized.update(entries)
+        file_results.append({"index": idx, "ok": True, "count": len(entries)})
+
+    if not normalized:
+        return {
+            "ok": False,
+            "error": "no valid account entries found",
+            "imported": [],
+            "files": len(payloads),
+            "file_results": file_results,
+            "parse_errors": parse_errors,
+        }
+
+    result = merge_normalized_accounts(normalized, merge=merge)
+    result["files"] = len(payloads)
+    result["parse_errors"] = parse_errors
+    result["file_results"] = file_results
+    if parse_errors:
+        result["message"] = (
+            f"批量导入完成：{result.get('count', 0)} 个账号，{parse_errors} 个文件失败"
+        )
+    else:
+        result["message"] = f"批量导入完成：{result.get('count', 0)} 个账号"
     return result
 
 
@@ -535,19 +886,83 @@ def import_auth_payload(
     if not normalized:
         return {"ok": False, "error": "entries missing token"}
 
-    existing: dict[str, Any] = {}
-    if merge and AUTH_FILE.is_file():
-        existing = read_auth_map()
-        backup = AUTH_FILE.with_suffix(f".bak.{int(time.time())}")
+    # PostgreSQL is primary. Prefer row-level upsert so registration / imports
+    # never depend on local auth.json existence.
+    try:
+        from store.accounts_pg import enabled as pg_on, upsert_account_merged
+    except Exception:
+        pg_on = lambda: False  # type: ignore
+        upsert_account_merged = None  # type: ignore
+
+    imported = []
+    if pg_on() and upsert_account_merged is not None:
+        for aid, nent in normalized.items():
+            try:
+                actual_id = upsert_account_merged(
+                    aid, nent, merge_same_user=bool(merge)
+                ) or aid
+            except Exception as e:  # noqa: BLE001
+                return {"ok": False, "error": f"write PostgreSQL accounts failed: {e}"}
+            imported.append(
+                {
+                    "id": actual_id,
+                    "email": nent.get("email"),
+                    "user_id": nent.get("user_id"),
+                    "expires_at": nent.get("expires_at"),
+                    "has_refresh_token": bool(nent.get("refresh_token")),
+                    "token_hint": _mask_token(nent.get("key")),
+                }
+            )
+        # Ensure durable pool status rows exist (created by _upsert_one ON CONFLICT DO NOTHING).
         try:
-            shutil.copy2(AUTH_FILE, backup)
-        except OSError:
-            pass
-        try:
-            normalize_auth_file_keys()
-            existing = read_auth_map()
+            from settings_store import get_account_pool_state, patch_account_pool_meta
+
+            state = get_account_pool_state() or {}
+            for row in imported:
+                rid = str(row.get("id") or "")
+                if rid and rid not in state:
+                    patch_account_pool_meta(
+                        rid,
+                        {
+                            "enabled": True,
+                            "weight": 1,
+                            "pool_status": "normal",
+                            "cooldown_count": 0,
+                        },
+                    )
         except Exception:
             pass
+        total = 0
+        try:
+            from store.accounts_pg import count_accounts
+
+            total = int(count_accounts() or 0)
+        except Exception:
+            total = len(imported)
+        return {
+            "ok": True,
+            "message": f"已导入 {len(imported)} 个账号到 PostgreSQL（多账号合并={merge}）",
+            "imported": imported,
+            "auth_file": str(AUTH_FILE),
+            "storage": "postgres",
+            "total_accounts": total,
+        }
+
+    # File fallback only when PostgreSQL is unavailable.
+    existing: dict[str, Any] = {}
+    if merge:
+        existing = read_auth_map()
+        if AUTH_FILE.is_file():
+            backup = AUTH_FILE.with_suffix(f".bak.{int(time.time())}")
+            try:
+                shutil.copy2(AUTH_FILE, backup)
+            except OSError:
+                pass
+            try:
+                normalize_auth_file_keys()
+                existing = read_auth_map()
+            except Exception:
+                pass
 
     if merge:
         for aid, nent in normalized.items():
@@ -570,9 +985,8 @@ def import_auth_payload(
         normalize_auth_file_keys()
         final = read_auth_map()
     except OSError as e:
-        return {"ok": False, "error": f"write auth.json failed: {e}"}
+        return {"ok": False, "error": f"write auth store failed: {e}"}
 
-    imported = []
     for k, e in normalized.items():
         actual_id = k
         for fk, fv in final.items():
@@ -591,9 +1005,10 @@ def import_auth_payload(
         )
     return {
         "ok": True,
-        "message": f"已导入 {len(imported)} 个账号到 {AUTH_FILE}（多账号合并={merge}）",
+        "message": f"已导入 {len(imported)} 个账号（多账号合并={merge}；storage=file）",
         "imported": imported,
         "auth_file": str(AUTH_FILE),
+        "storage": "file",
         "total_accounts": len(final) if isinstance(final, dict) else 0,
     }
 

@@ -18,7 +18,7 @@ import conversation_affinity
 import model_health
 import quota
 import token_maintainer
-from auth import AuthError, load_credentials
+from auth import AuthError, load_credentials, load_credentials_by_id
 import config as _config
 import sso_to_auth_json as sso_import
 
@@ -40,13 +40,20 @@ from config import (
 from models import load_models_from_cache, resolve_model, sync_models_from_upstream
 from settings_store import (
     VALID_ACCOUNT_MODES,
+    change_admin_password,
     create_session_token,
     get_account_mode,
     get_public_settings,
+    get_registration_config,
     is_setup_needed,
+    resolve_registration_inputs,
     revoke_session,
     set_account_mode,
+    set_model_health_enabled,
+    set_registration_config,
+    set_token_maintain_enabled,
     set_admin_password,
+    update_runtime_settings,
     verify_admin_password,
     verify_session_token,
 )
@@ -83,8 +90,54 @@ class LoginModeBody(BaseModel):
     capture: bool | None = None
 
 
+class FeatureToggleBody(BaseModel):
+    enabled: bool
+
+
 class AccountModeBody(BaseModel):
     mode: str = Field(description="round_robin | random | least_used")
+
+
+class ChangePasswordBody(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=4, max_length=128)
+    confirm_password: str | None = Field(default=None, max_length=128)
+
+
+class RuntimeSettingsBody(BaseModel):
+    """Partial update for admin system settings page."""
+
+    account_mode: str | None = None
+    token_maintain_enabled: bool | None = None
+    model_health_enabled: bool | None = None
+    reasoning_compat: str | None = Field(
+        default=None, description="off | think_tag | content"
+    )
+    outbound_max_tools: int | None = Field(default=None, ge=0, le=64)
+    outbound_tool_gap_sec: float | None = Field(default=None, ge=0.0, le=2.0)
+    history_compact_enabled: bool | None = None
+    sse_keepalive: float | None = Field(default=None, ge=2.0, le=120.0)
+    conversation_affinity_enabled: bool | None = None
+    default_model: str | None = Field(default=None, max_length=128)
+    # Pool rotation / cooldown policy
+    cooldown_default_sec: float | None = Field(default=None, ge=1, le=600)
+    cooldown_auth_sec: float | None = Field(default=None, ge=5, le=1800)
+    cooldown_rate_limit_sec: float | None = Field(default=None, ge=5, le=1800)
+    cooldown_server_error_sec: float | None = Field(default=None, ge=1, le=600)
+    cooldown_max_sec: float | None = Field(default=None, ge=30, le=3600)
+    soft_model_block_ttl_sec: float | None = Field(default=None, ge=30, le=3600)
+    durable_model_block_ttl_sec: float | None = Field(default=None, ge=60, le=86400)
+    probe_fail_kick_streak: int | None = Field(default=None, ge=1, le=20)
+    probe_fail_disable_streak: int | None = Field(default=None, ge=2, le=50)
+    probe_kick_cooldown_sec: float | None = Field(default=None, ge=30, le=7200)
+    max_failover_attempts: int | None = Field(default=None, ge=1, le=64)
+    pool_policy: dict[str, Any] | None = None
+
+
+class KickAccountBody(BaseModel):
+    reason: str = Field(default="手动移出轮询", max_length=300)
+    # >0: temporary cooldown kick; null/0: disable account from pool
+    cooldown_sec: float | None = Field(default=None, ge=0, le=3600)
 
 
 class AccountEnabledBody(BaseModel):
@@ -158,6 +211,23 @@ class EmailRegistrationProxyTestBody(BaseModel):
     proxy_password: str | None = Field(default=None, max_length=512)
 
 
+class RegistrationConfigBody(BaseModel):
+    """Persist protocol-registration form (MoeMail / YesCaptcha / proxy)."""
+
+    base_url: str | None = Field(default=None, max_length=256)
+    api_key: str | None = Field(default=None, max_length=512)
+    domain: str | None = Field(default=None, max_length=128)
+    prefix: str | None = Field(default=None, max_length=64)
+    expiry_ms: int | None = Field(default=None, ge=0, le=259200000)
+    yescaptcha_key: str | None = Field(default=None, max_length=512)
+    proxy: str | None = Field(default=None, max_length=512)
+    proxy_username: str | None = Field(default=None, max_length=256)
+    proxy_password: str | None = Field(default=None, max_length=512)
+    count: int | None = Field(default=None, ge=1, le=10000)
+    concurrency: int | None = Field(default=None, ge=1, le=10)
+    stagger_ms: int | None = Field(default=None, ge=0, le=10000)
+
+
 class RefreshBody(BaseModel):
     force: bool = Field(
         default=True,
@@ -190,7 +260,43 @@ class AccountProbeBody(BaseModel):
     )
 
 
+class AccountProbeBatchBody(BaseModel):
+    """Probe selected accounts (multi-select)."""
+
+    ids: list[str] = Field(default_factory=list, max_length=500)
+    model: str | None = Field(
+        default=None, description="Model id; default DEFAULT_MODEL / PROBE_MODELS"
+    )
+    auto_disable: bool | None = Field(default=None)
+
+
 # ── auth helpers ────────────────────────────────────────────────────────────
+
+ADMIN_COOKIE = "g2a_admin"
+ADMIN_COOKIE_MAX_AGE = 7 * 24 * 3600  # match redis/file session TTL
+
+
+def _set_admin_cookie(response: Response, token: str) -> None:
+    """Persist admin session in HttpOnly cookie so page navigations keep auth
+    even if localStorage is missing / cleared, until cookie or server session expires.
+    """
+    if not token:
+        return
+    response.set_cookie(
+        key=ADMIN_COOKIE,
+        value=token,
+        max_age=ADMIN_COOKIE_MAX_AGE,
+        httponly=True,
+        samesite="lax",
+        secure=False,  # allow plain http admin deployments
+        path="/",
+    )
+
+
+def _clear_admin_cookie(response: Response) -> None:
+    response.delete_cookie(key=ADMIN_COOKIE, path="/")
+
+
 
 
 def _extract_session(request: Request, x_admin_token: str | None) -> str | None:
@@ -210,6 +316,50 @@ def require_admin(
     if verify_session_token(token):
         return token or ""
     raise HTTPException(status_code=401, detail="Admin authentication required")
+
+
+def _client_ip(request: Request | None) -> str | None:
+    if request is None:
+        return None
+    try:
+        xff = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+        if xff:
+            return xff[:80]
+        if request.client and request.client.host:
+            return str(request.client.host)[:80]
+    except Exception:
+        return None
+    return None
+
+
+def audit_log(
+    request: Request | None,
+    *,
+    action: str,
+    summary: str = "",
+    target_type: str | None = None,
+    target_id: str | None = None,
+    detail: dict[str, Any] | None = None,
+    ok: bool = True,
+    actor: str = "admin",
+) -> None:
+    """Best-effort write of an admin operation log to PostgreSQL."""
+    try:
+        from store.audit_pg import write_log
+
+        write_log(
+            action=action,
+            summary=summary,
+            actor=actor,
+            target_type=target_type,
+            target_id=target_id,
+            detail=detail,
+            ip=_client_ip(request),
+            user_agent=(request.headers.get("user-agent") if request is not None else None),
+            ok=ok,
+        )
+    except Exception:
+        pass
 
 
 # ── public (no session) ─────────────────────────────────────────────────────
@@ -272,48 +422,72 @@ def _public_api_base(request: Request | None = None) -> str:
     return f"http://{display}:{port}/v1"
 
 
+_status_store_cache: dict[str, Any] | None = None
+_status_store_at = 0.0
+_status_reg_cache: dict[str, Any] | None = None
+_status_reg_at = 0.0
+
+
 @router.get("/status")
 async def admin_status(request: Request):
+    """Fast admin heartbeat.
+
+    Avoid account acquire() and full account dumps — those dominate latency with
+    500+ accounts and make UI auto-refresh feel stuck.
+    """
+    global _status_store_cache, _status_store_at, _status_reg_cache, _status_reg_at
     setup = is_setup_needed()
-    # Counts only on this frequent poll — full account rows live on /accounts.
     account = accounts.account_status(include_accounts=False)
     key_stats = apikeys.stats()
-    # Counts only — full account list belongs on /accounts and /dashboard.
     pool = account_pool.pool_summary(include_accounts=False)
-    creds_ok = False
+
+    # Derive credentials snapshot from counts (no acquire/OIDC).
+    creds_ok = int(account.get("active_count") or pool.get("live") or 0) > 0
     creds_email = None
-    try:
-        # Never OIDC-refresh on a frequent status poll.
-        c = account_pool.acquire(auto_refresh=False)
-        creds_ok = True
-        creds_email = c.email
-    except AuthError:
-        pass
 
     host = _config.HOST
     port = _config.PORT
     public_origin = _request_public_origin(request)
     api_base = _public_api_base(request)
 
-    # registration fingerprint — useful to detect stale Docker images
-    reg_status: dict[str, Any] = {"available": False}
-    try:
-        if reg_adapter is not None:
-            reg_status = reg_adapter.registration_available()
-        else:
-            reg_status = {"available": False, "error": _REG_IMPORT_ERROR}
-    except Exception as e:  # noqa: BLE001
-        reg_status = {"available": False, "error": str(e)}
+    now = time.time()
+    reg_status: dict[str, Any]
+    if _status_reg_cache is not None and now - _status_reg_at < 30:
+        reg_status = dict(_status_reg_cache)
+    else:
+        reg_status = {"available": False}
+        try:
+            if reg_adapter is not None:
+                reg_status = reg_adapter.registration_available()
+            else:
+                reg_status = {"available": False, "error": _REG_IMPORT_ERROR}
+        except Exception as e:  # noqa: BLE001
+            reg_status = {"available": False, "error": str(e)}
+        _status_reg_cache = dict(reg_status)
+        _status_reg_at = now
 
     try:
         from app import APP_VERSION as _app_ver
     except Exception:
         _app_ver = "unknown"
 
+    if _status_store_cache is not None and now - _status_store_at < 5:
+        store_info = dict(_status_store_cache)
+    else:
+        store_info = {}
+        try:
+            from store import store_status
+            store_info = store_status()
+        except Exception as e:  # noqa: BLE001
+            store_info = {"backend": "unknown", "error": str(e)}
+        _status_store_cache = dict(store_info)
+        _status_store_at = now
+
     return {
         "ok": True,
         "setup_needed": setup,
         "version": _app_ver,
+        "store": store_info,
         "cli_version": CLI_VERSION,
         "host": host,
         "port": port,
@@ -327,11 +501,14 @@ async def admin_status(request: Request):
         "account_mode": get_account_mode(),
         "accounts": account,
         "pool": {
-            "mode": pool["mode"],
-            "total": pool["total"],
-            "live": pool["live"],
-            "enabled": pool["enabled"],
-            "in_cooldown": pool["in_cooldown"],
+            "mode": pool.get("mode"),
+            "total": pool.get("total"),
+            "live": pool.get("live"),
+            "enabled": pool.get("enabled"),
+            "in_cooldown": pool.get("in_cooldown"),
+            "quota_disabled": pool.get("quota_disabled"),
+            "model_blocked": pool.get("model_blocked"),
+            "source": pool.get("source") or "postgres",
         },
         "keys": key_stats,
         "models_count": len(load_models_from_cache()),
@@ -352,17 +529,35 @@ async def admin_setup(body: SetupBody):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     token = create_session_token()
-    return {"ok": True, "token": token, "message": "Admin password created"}
+    resp = JSONResponse({"ok": True, "token": token, "message": "Admin password created"})
+    _set_admin_cookie(resp, token)
+    return resp
 
 
 @router.post("/login")
-async def admin_login(body: LoginBody):
+async def admin_login(body: LoginBody, request: Request):
     if is_setup_needed():
         raise HTTPException(status_code=400, detail="Setup required first")
     if not verify_admin_password(body.password):
         raise HTTPException(status_code=401, detail="Invalid password")
     token = create_session_token()
-    return {"ok": True, "token": token}
+    audit_log(request, action="admin.login", summary="管理员登录成功")
+    resp = JSONResponse({"ok": True, "token": token})
+    _set_admin_cookie(resp, token)
+    return resp
+
+
+@router.get("/session")
+async def admin_session(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Cheap session probe: 200 if cookie/header token still valid."""
+    token = _extract_session(request, x_admin_token)
+    if verify_session_token(token):
+        # sliding refresh already happens inside verify_session_token
+        return {"ok": True, "authenticated": True}
+    raise HTTPException(status_code=401, detail="Admin authentication required")
 
 
 @router.post("/logout")
@@ -372,7 +567,9 @@ async def admin_logout(
 ):
     token = _extract_session(request, x_admin_token)
     revoke_session(token)
-    return {"ok": True}
+    resp = JSONResponse({"ok": True})
+    _clear_admin_cookie(resp)
+    return resp
 
 
 # ── protected ───────────────────────────────────────────────────────────────
@@ -382,22 +579,26 @@ async def admin_logout(
 async def dashboard(
     request: Request,
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    full: bool = False,
 ):
+    """Overview payload.
+
+    Default is summary-only (fast). Pass ?full=1 only when a page truly needs
+    embedded account rows (legacy). Accounts page should use /accounts.
+    """
     require_admin(request, x_admin_token)
-    account = accounts.account_status()
+    account = accounts.account_status(include_accounts=bool(full))
     key_stats = apikeys.stats()
-    pool = account_pool.pool_summary()
-    try:
-        c = load_credentials()
-        cred = {
-            "email": c.email,
-            "user_id": c.user_id,
-            "expires_at": c.expires_at,
-            "auth_key": c.auth_key,
-            "team_id": c.team_id,
-        }
-    except AuthError as e:
-        cred = {"error": str(e)}
+    # Overview uses light pool summary (DB snapshot). full=1 still embeds accounts.
+    pool = account_pool.pool_summary(include_accounts=bool(full))
+    # Do NOT call load_credentials()/OIDC on overview refresh — it can stall and
+    # surface browser "Failed to fetch" when a worker is busy.
+    cred = {
+        "email": None,
+        "active_count": account.get("active_count"),
+        "account_count": account.get("account_count"),
+        "ok": int(account.get("active_count") or pool.get("live") or 0) > 0,
+    }
     host = _config.HOST
     port = _config.PORT
     public_origin = _request_public_origin(request)
@@ -420,6 +621,7 @@ async def dashboard(
         "token_maintainer": token_maintainer.status(light=True),
         "model_health": model_health.status(light=True),
         "conversation_affinity": conversation_affinity.status(),
+        "full": bool(full),
     }
 
 
@@ -429,7 +631,12 @@ async def list_keys(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
     require_admin(request, x_admin_token)
-    return {"keys": apikeys.list_keys(), "stats": apikeys.stats()}
+    return {
+        "keys": apikeys.list_keys(),
+        "stats": apikeys.stats(),
+        "store_source": apikeys.keys_store_source(),
+        "store_backend": apikeys.keys_store_source(),
+    }
 
 
 @router.post("/keys")
@@ -440,6 +647,14 @@ async def create_key(
 ):
     require_admin(request, x_admin_token)
     rec = apikeys.create_key(body.name, body.note)
+    audit_log(
+        request,
+        action="keys.create",
+        summary=f"创建 API Key：{rec.get('name') or body.name}",
+        target_type="api_key",
+        target_id=rec.get("id"),
+        detail={"name": rec.get("name"), "prefix": rec.get("prefix")},
+    )
     return {"ok": True, "key": rec}
 
 
@@ -453,6 +668,14 @@ async def regenerate_key(
     rec = apikeys.regenerate_key(key_id)
     if not rec:
         raise HTTPException(status_code=404, detail="Key not found")
+    audit_log(
+        request,
+        action="keys.regenerate",
+        summary=f"重建 API Key：{rec.get('name') or key_id}",
+        target_type="api_key",
+        target_id=key_id,
+        detail={"name": rec.get("name"), "prefix": rec.get("prefix")},
+    )
     return {"ok": True, "key": rec}
 
 
@@ -492,6 +715,13 @@ async def delete_key(
     require_admin(request, x_admin_token)
     if not apikeys.delete_key(key_id):
         raise HTTPException(status_code=404, detail="Key not found")
+    audit_log(
+        request,
+        action="keys.delete",
+        summary=f"删除 API Key：{key_id}",
+        target_type="api_key",
+        target_id=key_id,
+    )
     return {"ok": True}
 
 
@@ -499,11 +729,240 @@ async def delete_key(
 async def list_accounts_route(
     request: Request,
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    page: int = 1,
+    page_size: int = 25,
+    q: str = "",
+    summary: bool = False,
 ):
+    """List accounts with server-side SQL pagination (PostgreSQL path).
+
+    - default: paged rows for admin UI (fast first paint)
+    - summary=1: counts only
+    - page_size<=0 or page_size>=10000: return all summary rows (export/legacy)
+    """
     require_admin(request, x_admin_token)
-    status = accounts.account_status()
-    status["pool"] = account_pool.pool_summary()
-    return status
+
+    if summary:
+        status = accounts.account_status(include_accounts=False)
+        status["pool"] = account_pool.pool_summary(include_accounts=False)
+        status["page"] = 1
+        status["page_size"] = 0
+        status["total"] = int(status.get("account_count") or 0)
+        status["total_pages"] = 1
+        status["q"] = (q or "").strip()
+        return status
+
+    # Fast path: page in PostgreSQL, attach pool meta only for current page.
+    try:
+        from store.accounts_pg import enabled as pg_on, list_account_summaries
+        from store.settings_pg import get_pool_meta_many, pool_counts
+        from settings_store import get_account_mode
+        import time as _time
+
+        if pg_on():
+            paged = list_account_summaries(q=q, page=page, page_size=page_size)
+            page_items = list(paged.get("accounts") or [])
+            ids = [str(a.get("id")) for a in page_items if a.get("id")]
+            pool_map = get_pool_meta_many(ids) if ids else {}
+            now = _time.time()
+            # Optional redis overlay only for the current page (not whole pool).
+            try:
+                from store.pool_redis import merge_pool_meta
+            except Exception:
+                merge_pool_meta = None  # type: ignore
+            for item in page_items:
+                aid = item.get("id")
+                meta = dict(pool_map.get(aid) or {})
+                if merge_pool_meta is not None and aid:
+                    try:
+                        meta = merge_pool_meta(str(aid), meta)
+                    except Exception:
+                        pass
+                blocked = meta.get("blocked_models") or {}
+                if not isinstance(blocked, dict):
+                    blocked = {}
+                cd_until = meta.get("cooldown_until")
+                in_cd = False
+                cd_left = 0.0
+                if cd_until is not None:
+                    try:
+                        cd_left = max(0.0, float(cd_until) - now)
+                        in_cd = cd_left > 0
+                    except Exception:
+                        in_cd = False
+                        cd_left = 0.0
+                item["_pool"] = {
+                    "id": aid,
+                    "enabled": bool(meta.get("enabled", True)),
+                    "weight": int(meta.get("weight") or 1),
+                    "request_count": int(meta.get("request_count") or 0),
+                    "success_count": int(meta.get("success_count") or 0),
+                    "fail_count": int(meta.get("fail_count") or 0),
+                    "last_used_at": meta.get("last_used_at"),
+                    "last_error": meta.get("last_error"),
+                    "cooldown_until": cd_until,
+                    "cooldown_remaining_sec": cd_left,
+                    "disabled_for_quota": bool(meta.get("disabled_for_quota")),
+                    "disabled_reason": meta.get("disabled_reason"),
+                    "quota_disabled_at": meta.get("quota_disabled_at"),
+                    "quota_source": meta.get("quota_source"),
+                    "last_quota": meta.get("last_quota"),
+                    "last_probe": meta.get("last_probe"),
+                    "blocked_model_ids": list(blocked.keys()),
+                    "in_cooldown": in_cd,
+                }
+
+            counts = pool_counts()
+            # live ≈ account rows with non-expired token; use page totals for chips
+            total = int(paged.get("total") or 0)
+            # cheap live estimate from account_status counts path
+            base_counts = accounts.account_status(include_accounts=False)
+            return {
+                "store_source": "postgres",
+                "store_backend": "postgres",
+                "auth_file": base_counts.get("auth_file"),
+                "auth_file_exists": base_counts.get("auth_file_exists"),
+                "auth_file_role": "mirror",
+                "logged_in": base_counts.get("logged_in"),
+                "account_count": base_counts.get("account_count") or total,
+                "active_count": base_counts.get("active_count") or total,
+                "account_mode": get_account_mode(),
+                "platform": base_counts.get("platform"),
+                "is_linux": base_counts.get("is_linux"),
+                "is_headless": base_counts.get("is_headless"),
+                "native_oidc_available": base_counts.get("native_oidc_available"),
+                "multi_account": True,
+                "accounts": page_items,
+                "pool": {
+                    "mode": get_account_mode(),
+                    "total": counts.get("total") or total,
+                    "live": base_counts.get("active_count") or total,
+                    "enabled": counts.get("enabled") or total,
+                    "in_cooldown": counts.get("in_cooldown") or 0,
+                    "quota_disabled": counts.get("quota_disabled") or 0,
+                    "model_blocked": counts.get("model_blocked") or 0,
+                },
+                "page": paged.get("page") or 1,
+                "page_size": paged.get("page_size") or page_size,
+                "total": total,
+                "total_pages": paged.get("total_pages") or 1,
+                "q": (q or "").strip(),
+                "paged": True,
+                "fast_path": True,
+            }
+    except Exception:
+        # Fall through to legacy full-scan path (file backend / unexpected errors).
+        pass
+
+    # Legacy path: build full merged rows then filter/page (file backend).
+    base = accounts.account_status(include_accounts=True)
+    pool_full = account_pool.pool_summary(include_accounts=True)
+    pool_accounts = list(pool_full.get("accounts") or [])
+    pool_map = {a.get("id"): a for a in pool_accounts if isinstance(a, dict) and a.get("id")}
+    rows = []
+    for acc in (base.get("accounts") or []):
+        if not isinstance(acc, dict):
+            continue
+        aid = acc.get("id")
+        p = dict(pool_map.get(aid) or {"id": aid})
+        item = dict(acc)
+        item["_pool"] = {
+            "id": p.get("id") or aid,
+            "enabled": p.get("enabled", True),
+            "weight": p.get("weight", 1),
+            "request_count": p.get("request_count", 0),
+            "success_count": p.get("success_count", 0),
+            "fail_count": p.get("fail_count", 0),
+            "last_used_at": p.get("last_used_at"),
+            "last_error": p.get("last_error"),
+            "cooldown_until": p.get("cooldown_until"),
+            "disabled_for_quota": p.get("disabled_for_quota"),
+            "disabled_reason": p.get("disabled_reason"),
+            "quota_disabled_at": p.get("quota_disabled_at"),
+            "quota_source": p.get("quota_source"),
+            "last_quota": p.get("last_quota"),
+            "last_probe": p.get("last_probe"),
+            "blocked_model_ids": p.get("blocked_model_ids") or [],
+            "in_cooldown": p.get("in_cooldown", False),
+        }
+        rows.append(item)
+
+    query = (q or "").strip().lower()
+    if query:
+        filtered = []
+        for arow in rows:
+            p = arow.get("_pool") or {}
+            hay = " ".join([
+                str(arow.get("email") or ""),
+                str(arow.get("id") or ""),
+                str(arow.get("user_id") or ""),
+                "expired 已过期" if arow.get("expired") else "valid 有效",
+                "disabled 已禁用" if p.get("enabled") is False else "enabled 启用",
+                "cooldown 冷却" if p.get("in_cooldown") else "",
+                "quota 额度禁用 耗尽" if p.get("disabled_for_quota") else "",
+                str(p.get("last_error") or ""),
+                " ".join(p.get("blocked_model_ids") or []),
+            ]).lower()
+            if query in hay:
+                filtered.append(arow)
+        rows = filtered
+
+    total = len(rows)
+    try:
+        page_size_i = int(page_size)
+    except Exception:
+        page_size_i = 25
+    try:
+        page_i = max(1, int(page))
+    except Exception:
+        page_i = 1
+
+    if page_size_i <= 0 or page_size_i >= 10000:
+        page_items = rows
+        page_i = 1
+        page_size_i = total or 0
+        total_pages = 1
+    else:
+        page_size_i = max(1, min(200, page_size_i))
+        total_pages = max(1, (total + page_size_i - 1) // page_size_i)
+        page_i = min(page_i, total_pages)
+        start = (page_i - 1) * page_size_i
+        page_items = rows[start:start + page_size_i]
+
+    out = {
+        "store_source": base.get("store_source") or base.get("store_backend") or "file",
+        "store_backend": base.get("store_backend") or base.get("store_source") or "file",
+        "auth_file": base.get("auth_file"),
+        "auth_file_exists": base.get("auth_file_exists"),
+        "auth_file_role": base.get("auth_file_role") or "mirror",
+        "logged_in": base.get("logged_in"),
+        "account_count": base.get("account_count"),
+        "active_count": base.get("active_count"),
+        "account_mode": base.get("account_mode"),
+        "platform": base.get("platform"),
+        "is_linux": base.get("is_linux"),
+        "is_headless": base.get("is_headless"),
+        "native_oidc_available": base.get("native_oidc_available"),
+        "multi_account": base.get("multi_account"),
+        "accounts": page_items,
+        "pool": {
+            "mode": pool_full.get("mode"),
+            "total": pool_full.get("total"),
+            "live": pool_full.get("live"),
+            "enabled": pool_full.get("enabled"),
+            "in_cooldown": pool_full.get("in_cooldown"),
+            "quota_disabled": pool_full.get("quota_disabled"),
+            "model_blocked": pool_full.get("model_blocked"),
+        },
+        "page": page_i,
+        "page_size": page_size_i,
+        "total": total,
+        "total_pages": total_pages,
+        "q": (q or "").strip(),
+        "paged": True,
+        "fast_path": False,
+    }
+    return out
 
 
 @router.post("/accounts/login")
@@ -594,79 +1053,132 @@ async def import_sso(
     ok = 0
     fail = 0
 
-    def _import_one(args: tuple[int, str, str]) -> dict[str, Any]:
-        i, email_hint, sso = args
-        if body.delay > 0 and i > 1:
-            time.sleep(body.delay * (i - 1))
-        item: dict[str, Any] = {"index": i, "sso_hint": sso[:12] + "..." if len(sso) > 12 else "..."}
-        try:
-            token = sso_import.sso_to_token(sso)
-            if not token:
-                item["status"] = "failed"
-                item["error"] = "device flow failed or invalid sso"
-                return item
-            key, entry = sso_import.token_to_auth_entry(token, email=email_hint)
-            import_result = accounts.import_auth_payload(
-                {
-                    "key": entry["key"],
-                    "auth_mode": entry.get("auth_mode", "oidc"),
-                    "email": entry.get("email", email_hint),
-                    "refresh_token": entry.get("refresh_token", ""),
-                    "expires_at": entry.get("expires_at"),
-                    "oidc_issuer": entry.get("oidc_issuer", sso_import.OIDC_ISSUER),
-                    "oidc_client_id": entry.get("oidc_client_id", sso_import.GROK_CLI_CLIENT_ID),
-                },
-                merge=body.merge,
-            )
-            if not import_result.get("ok"):
-                item["status"] = "failed"
-                item["error"] = import_result.get("error") or "import failed"
-                return item
-            info = (import_result.get("imported") or [{}])[0]
-            item["status"] = "ok"
-            item["account_id"] = info.get("id")
-            item["email"] = info.get("email")
-            item["user_id"] = info.get("user_id")
-            item["expires_at"] = info.get("expires_at")
-            item["has_refresh_token"] = info.get("has_refresh_token")
-            return item
-        except Exception as e:  # noqa: BLE001
-            item["status"] = "failed"
-            item["error"] = str(e)
-            return item
-
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     try:
         from config import SSO_IMPORT_WORKERS
     except Exception:
         SSO_IMPORT_WORKERS = 4
-    # Hard cap regardless of client-supplied max_workers (714×curl_cffi freezes WSL)
+    # Hard cap regardless of client-supplied max_workers
     workers = min(int(body.max_workers), int(SSO_IMPORT_WORKERS), max(1, len(sso_items)))
+    # If delay is large, prefer fewer workers to keep pacing meaningful.
+    if body.delay and body.delay >= 2:
+        workers = min(workers, 2)
+
+    # Stage 1: convert SSO -> token entries concurrently (network bound)
+    # Stage 2: merge all successful entries with ONE auth write (storage bound)
+    pending_entries: list[dict[str, Any]] = []
+
+    def _convert_one(args: tuple[int, str, str]) -> dict[str, Any]:
+        i, email_hint, sso = args
+        if body.delay > 0 and i > 1:
+            # tiny staggered start only (seconds), not cumulative per index
+            time.sleep(min(float(body.delay), 3.0) * (((i - 1) % max(1, workers)) / max(1.0, float(workers))))
+        item: dict[str, Any] = {
+            "index": i,
+            "sso_hint": (sso[:12] + "...") if len(sso) > 12 else sso,
+        }
+        try:
+            token = sso_import.sso_to_token(sso)
+            if not token:
+                item["status"] = "failed"
+                item["error"] = "device flow failed or invalid sso"
+                return item
+            _key, entry = sso_import.token_to_auth_entry(token, email=email_hint)
+            item["status"] = "converted"
+            item["entry"] = {
+                "key": entry["key"],
+                "auth_mode": entry.get("auth_mode", "oidc"),
+                "email": entry.get("email", email_hint),
+                "refresh_token": entry.get("refresh_token", ""),
+                "expires_at": entry.get("expires_at"),
+                "oidc_issuer": entry.get("oidc_issuer", sso_import.OIDC_ISSUER),
+                "oidc_client_id": entry.get(
+                    "oidc_client_id", sso_import.GROK_CLI_CLIENT_ID
+                ),
+                "user_id": entry.get("user_id") or entry.get("principal_id"),
+            }
+            return item
+        except Exception as e:  # noqa: BLE001
+            item["status"] = "failed"
+            item["error"] = str(e)
+            return item
+
+    converted: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sso-import-") as ex:
-        for fut in as_completed(ex.submit(_import_one, (i, e, s)) for i, (e, s) in enumerate(sso_items, 1)):
-            item = fut.result()
-            results.append(item)
-            if item.get("status") == "ok":
+        futs = [
+            ex.submit(_convert_one, (i, e, s))
+            for i, (e, s) in enumerate(sso_items, 1)
+        ]
+        for fut in as_completed(futs):
+            converted.append(fut.result())
+
+    # preserve input order in results
+    converted.sort(key=lambda x: int(x.get("index") or 0))
+    for item in converted:
+        if item.get("status") != "converted":
+            fail += 1
+            results.append({k: v for k, v in item.items() if k != "entry"})
+            continue
+        pending_entries.append(item["entry"])
+        results.append({k: v for k, v in item.items() if k != "entry"})
+
+    if pending_entries:
+        # one storage write for all converted accounts
+        bulk = accounts.import_auth_payloads_bulk(pending_entries, merge=body.merge)
+        if not bulk.get("ok"):
+            # mark all converted as failed import
+            for item in results:
+                if item.get("status") is None:
+                    continue
+            # fallback: mark recent converted rows failed
+            for item in results:
+                if "account_id" not in item and item.get("status") not in ("failed", "ok"):
+                    item["status"] = "failed"
+                    item["error"] = bulk.get("error") or "bulk import failed"
+                    fail += 1
+        else:
+            # map imported by email/user roughly
+            imp = bulk.get("imported") or []
+            # attach in order as best-effort
+            imp_iter = iter(imp)
+            for item in results:
+                if item.get("status") == "failed":
+                    continue
+                info = next(imp_iter, None)
+                if not info:
+                    item["status"] = "ok"
+                    ok += 1
+                    continue
+                item["status"] = "ok"
+                item["account_id"] = info.get("id")
+                item["email"] = info.get("email") or item.get("email")
+                item["user_id"] = info.get("user_id")
+                item["expires_at"] = info.get("expires_at")
+                item["has_refresh_token"] = info.get("has_refresh_token")
                 ok += 1
                 imported.append({
-                    "id": item.get("account_id"),
-                    "email": item.get("email"),
-                    "user_id": item.get("user_id"),
-                    "expires_at": item.get("expires_at"),
-                    "has_refresh_token": item.get("has_refresh_token"),
+                    "id": info.get("id"),
+                    "email": info.get("email"),
+                    "user_id": info.get("user_id"),
+                    "expires_at": info.get("expires_at"),
+                    "has_refresh_token": info.get("has_refresh_token"),
                 })
-            else:
-                fail += 1
+
+    # recount fail for non-ok
+    fail = sum(1 for x in results if x.get("status") != "ok")
+    ok = sum(1 for x in results if x.get("status") == "ok")
 
     return {
         "ok": fail == 0,
-        "message": f"SSO 导入完成：{ok} 成功, {fail} 失败",
+        "message": f"SSO 导入完成：{ok} 成功, {fail} 失败（workers={workers}）",
         "total": len(sso_cookies),
         "success": ok,
         "fail": fail,
         "imported": imported,
         "results": results,
+        "workers": workers,
+        "delay": body.delay,
     }
 
 
@@ -693,6 +1205,74 @@ def _require_register_adapter():
     return reg_adapter
 
 
+def _registration_cfg_from_body(body: EmailRegistrationBody | RegistrationConfigBody) -> dict:
+    return {
+        "base_url": body.base_url,
+        "api_key": getattr(body, "api_key", None),
+        "domain": getattr(body, "domain", None),
+        "prefix": getattr(body, "prefix", None),
+        "expiry_ms": getattr(body, "expiry_ms", None),
+        "yescaptcha_key": getattr(body, "yescaptcha_key", None),
+        "proxy": body.proxy,
+        "proxy_username": getattr(body, "proxy_username", None),
+        "proxy_password": getattr(body, "proxy_password", None),
+        "count": getattr(body, "count", None),
+        "concurrency": getattr(body, "concurrency", None),
+        "stagger_ms": getattr(body, "stagger_ms", None),
+    }
+
+
+@router.get("/accounts/register-email/config")
+async def get_email_registration_config(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Load protocol registration form config (DB + env defaults)."""
+    require_admin(request, x_admin_token)
+    cfg = get_registration_config(include_secrets=True)
+    return {
+        "ok": True,
+        "config": cfg,
+        "source": "database" if _registration_has_db_row() else "env",
+    }
+
+
+def _registration_has_db_row() -> bool:
+    try:
+        from settings_store import _get_setting_value
+
+        return isinstance(_get_setting_value("registration_config", None), dict)
+    except Exception:
+        return False
+
+
+@router.put("/accounts/register-email/config")
+async def put_email_registration_config(
+    body: RegistrationConfigBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Save protocol registration config to database (and apply to runtime)."""
+    require_admin(request, x_admin_token)
+    try:
+        cfg = set_registration_config(
+            body.model_dump(exclude_none=False),
+            replace=False,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"保存注册配置失败: {e}") from e
+    audit_log(
+        request,
+        action="register.config_save",
+        summary="保存协议注册配置",
+        target_type="registration",
+        detail={"keys": [k for k, v in body.model_dump(exclude_none=False).items() if v not in (None, "")]},
+    )
+    return {"ok": True, "config": cfg, "message": "注册配置已保存到数据库"}
+
+
 @router.post("/accounts/register-email")
 async def start_email_registration(
     body: EmailRegistrationBody,
@@ -702,32 +1282,44 @@ async def start_email_registration(
     """Start protocol registration (grok-build-auth) + MoeMail + SSO import.
 
     Supports multi-thread batch via count/concurrency/stagger_ms.
+    Non-empty form fields override the saved DB/env config; empty fields fall
+    back to the persisted registration_config. Successful starts also auto-save
+    non-secret form defaults (and any newly provided secrets) to the DB.
     """
     require_admin(request, x_admin_token)
     adapter = _require_register_adapter()
+    overrides = _registration_cfg_from_body(body)
+    resolved = resolve_registration_inputs(overrides)
+
+    # Auto-persist: keep last used form values so next open works after restart.
+    try:
+        set_registration_config(resolved, replace=False)
+    except Exception:
+        pass
+
     try:
         result = adapter.start_registration(
-            proxy=body.proxy,
-            moemail_api_key=body.api_key,
-            moemail_base_url=body.base_url,
-            prefix=body.prefix,
-            domain=body.domain,
-            expiry_ms=body.expiry_ms,
-            yescaptcha_key=body.yescaptcha_key,
-            count=body.count,
-            concurrency=body.concurrency,
-            stagger_ms=body.stagger_ms,
+            proxy=resolved.get("proxy") or None,
+            moemail_api_key=resolved.get("api_key") or None,
+            moemail_base_url=resolved.get("base_url") or None,
+            prefix=resolved.get("prefix") or None,
+            domain=resolved.get("domain") or None,
+            expiry_ms=resolved.get("expiry_ms"),
+            yescaptcha_key=resolved.get("yescaptcha_key") or None,
+            count=resolved.get("count"),
+            concurrency=resolved.get("concurrency"),
+            stagger_ms=resolved.get("stagger_ms"),
         )
     except TypeError:
         # Older adapter without batch kwargs.
         try:
             result = adapter.start_registration(
-                proxy=body.proxy,
-                moemail_api_key=body.api_key,
-                moemail_base_url=body.base_url,
-                prefix=body.prefix,
-                domain=body.domain,
-                yescaptcha_key=body.yescaptcha_key,
+                proxy=resolved.get("proxy") or None,
+                moemail_api_key=resolved.get("api_key") or None,
+                moemail_base_url=resolved.get("base_url") or None,
+                prefix=resolved.get("prefix") or None,
+                domain=resolved.get("domain") or None,
+                yescaptcha_key=resolved.get("yescaptcha_key") or None,
             )
         except Exception as e:  # noqa: BLE001
             raise HTTPException(status_code=400, detail=str(e)) from e
@@ -747,10 +1339,17 @@ async def test_email_registration_proxy(
     require_admin(request, x_admin_token)
     from moemail import test_xai_proxy
 
+    resolved = resolve_registration_inputs(
+        {
+            "proxy": body.proxy,
+            "proxy_username": body.proxy_username,
+            "proxy_password": body.proxy_password,
+        }
+    )
     return test_xai_proxy(
-        proxy=body.proxy,
-        proxy_username=body.proxy_username,
-        proxy_password=body.proxy_password,
+        proxy=resolved.get("proxy") or None,
+        proxy_username=resolved.get("proxy_username") or None,
+        proxy_password=resolved.get("proxy_password") or None,
     )
 
 
@@ -760,14 +1359,8 @@ async def test_email_registration_proxy_unscoped(
     request: Request,
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
-    require_admin(request, x_admin_token)
-    from moemail import test_xai_proxy
-
-    return test_xai_proxy(
-        proxy=body.proxy,
-        proxy_username=body.proxy_username,
-        proxy_password=body.proxy_password,
-    )
+    # Alias of /accounts/register-email/test-proxy for older UI paths.
+    return await test_email_registration_proxy(body, request, x_admin_token)
 
 
 @router.get("/accounts/register-email/sessions")
@@ -869,6 +1462,65 @@ async def import_account_file(
     return result
 
 
+
+@router.post("/accounts/import-files")
+async def import_account_files_bulk(
+    request: Request,
+    files: list[UploadFile] = File(..., description="one or more auth.json files"),
+    merge: str = Form(default="true"),
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Bulk JSON import: parse all files then one storage write."""
+    require_admin(request, x_admin_token)
+    merge_flag = str(merge).strip().lower() not in ("0", "false", "no", "off")
+    if not files:
+        raise HTTPException(status_code=400, detail="no files")
+    if len(files) > 200:
+        raise HTTPException(status_code=400, detail="too many files (max 200)")
+
+    payloads: list[Any] = []
+    file_meta: list[dict[str, Any]] = []
+    for f in files:
+        try:
+            raw_bytes = await f.read()
+        except Exception as e:  # noqa: BLE001
+            file_meta.append({"filename": f.filename, "ok": False, "error": f"read failed: {e}"})
+            continue
+        if not raw_bytes:
+            file_meta.append({"filename": f.filename, "ok": False, "error": "empty file"})
+            continue
+        if len(raw_bytes) > 8 * 1024 * 1024:
+            file_meta.append({"filename": f.filename, "ok": False, "error": "file too large (max 8MB)"})
+            continue
+        try:
+            text = raw_bytes.decode("utf-8-sig").strip()
+        except UnicodeDecodeError as e:
+            file_meta.append({"filename": f.filename, "ok": False, "error": f"utf-8 required: {e}"})
+            continue
+        if not text:
+            file_meta.append({"filename": f.filename, "ok": False, "error": "empty content"})
+            continue
+        try:
+            payload: Any = json.loads(text)
+        except json.JSONDecodeError:
+            if text.startswith("eyJ") and "." in text and "\n" not in text:
+                payload = text
+            else:
+                file_meta.append({"filename": f.filename, "ok": False, "error": "invalid JSON"})
+                continue
+        payloads.append(payload)
+        file_meta.append({"filename": f.filename, "ok": True})
+
+    if not payloads:
+        raise HTTPException(status_code=400, detail="no valid JSON files")
+
+    result = accounts.import_auth_payloads_bulk(payloads, merge=merge_flag)
+    result["file_meta"] = file_meta
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error") or "import failed")
+    return result
+
+
 def _export_response(
     result: dict[str, Any],
     *,
@@ -949,7 +1601,16 @@ async def account_logout(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
     require_admin(request, x_admin_token)
-    return accounts.run_logout()
+    result = accounts.run_logout()
+    audit_log(
+        request,
+        action="accounts.logout_all",
+        summary=result.get("message") if isinstance(result, dict) else "清空账号池",
+        target_type="pool",
+        detail=result if isinstance(result, dict) else None,
+        ok=bool((result or {}).get("ok", True)) if isinstance(result, dict) else True,
+    )
+    return result
 
 
 @router.delete("/accounts/{account_id:path}")
@@ -961,6 +1622,13 @@ async def delete_account(
     require_admin(request, x_admin_token)
     if not accounts.remove_account(account_id):
         raise HTTPException(status_code=404, detail="Account not found")
+    audit_log(
+        request,
+        action="accounts.delete",
+        summary=f"删除账号：{account_id}",
+        target_type="account",
+        target_id=account_id,
+    )
     return {"ok": True}
 
 
@@ -974,7 +1642,7 @@ async def delete_accounts_batch(
     request: Request,
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
-    """Delete multiple accounts from auth.json in one request."""
+    """Delete multiple accounts from durable store (PostgreSQL + file mirror)."""
     require_admin(request, x_admin_token)
     ids = [str(x).strip() for x in (body.ids or []) if str(x).strip()]
     if not ids:
@@ -982,6 +1650,18 @@ async def delete_accounts_batch(
     if len(ids) > 2000:
         raise HTTPException(status_code=400, detail="too many ids (max 2000)")
     result = accounts.remove_accounts(ids)
+    audit_log(
+        request,
+        action="accounts.delete_batch",
+        summary=f"批量删除账号 {result.get('removed_count') or len(result.get('removed') or [])} 个",
+        target_type="account",
+        detail={
+            "requested": result.get("requested"),
+            "removed_count": result.get("removed_count"),
+            "missing_count": result.get("missing_count"),
+            "removed_sample": (result.get("removed") or [])[:20],
+        },
+    )
     return {"ok": True, **result}
 
 
@@ -997,6 +1677,14 @@ async def set_account_enabled_route(
     if not found:
         raise HTTPException(status_code=404, detail="Account not found")
     rec = account_pool.set_account_enabled(account_id, body.enabled)
+    audit_log(
+        request,
+        action="accounts.set_enabled",
+        summary=f"{'启用' if body.enabled else '禁用'}账号：{account_id}",
+        target_type="account",
+        target_id=account_id,
+        detail={"enabled": bool(body.enabled)},
+    )
     return {"ok": True, "account": rec}
 
 
@@ -1004,10 +1692,73 @@ async def set_account_enabled_route(
 async def list_accounts_quota(
     request: Request,
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    cached: bool = False,
+    refresh: bool = False,
 ):
-    """Query billing quota for all accounts (cli-chat-proxy /v1/billing)."""
+    """Quota list.
+
+    - cached=1/refresh=0: return DB-cached last_quota only (fast)
+    - default/refresh=1: query upstream and persist snapshots
+    """
     require_admin(request, x_admin_token)
+    if cached and not refresh:
+        return quota.list_cached_quotas(include_expired=True)
     return await quota.fetch_all_quotas(include_expired=False)
+
+
+def _probe_result_with_pool(account_id: str, probe: dict[str, Any] | None) -> dict[str, Any]:
+    """Attach durable pool status so admin UI can patch rows without reload."""
+    out = dict(probe or {})
+    aid = str(out.get("account_id") or account_id or "").strip()
+    if not aid:
+        return out
+    try:
+        state = account_pool.get_account_pool_state() if hasattr(account_pool, "get_account_pool_state") else None
+    except Exception:
+        state = None
+    try:
+        from settings_store import get_account_pool_state
+
+        if state is None:
+            state = get_account_pool_state()
+        meta = (state or {}).get(aid) or {}
+        if not isinstance(meta, dict):
+            meta = {}
+        # Prefer account_pool helper for derived flags when available.
+        try:
+            pool_view = account_pool._pool_meta(aid, {aid: meta})  # noqa: SLF001
+        except Exception:
+            pool_view = meta
+        out["pool"] = {
+            "id": aid,
+            "enabled": pool_view.get("enabled", True),
+            "in_cooldown": bool(pool_view.get("in_cooldown")),
+            "pool_status": pool_view.get("pool_status") or "normal",
+            "cooldown_count": int(pool_view.get("cooldown_count") or 0),
+            "cooldown_until": pool_view.get("cooldown_until"),
+            "cooldown_sec": pool_view.get("cooldown_sec"),
+            "cooldown_reason": pool_view.get("cooldown_reason"),
+            "cooldown_code": pool_view.get("cooldown_code"),
+            "cooldown_model": pool_view.get("cooldown_model"),
+            "cooldown_tokens_actual": pool_view.get("cooldown_tokens_actual"),
+            "cooldown_tokens_limit": pool_view.get("cooldown_tokens_limit"),
+            "status_stack": pool_view.get("status_stack") or [],
+            "last_error": pool_view.get("last_error"),
+            "last_probe": pool_view.get("last_probe"),
+            "last_probe_status": pool_view.get("last_probe_status"),
+            "blocked_model_ids": pool_view.get("blocked_model_ids")
+            or list((pool_view.get("blocked_models") or {}).keys()),
+            "consecutive_fails": pool_view.get("consecutive_fails") or 0,
+            "probe_fail_streak": pool_view.get("probe_fail_streak") or 0,
+            "disabled_for_quota": bool(pool_view.get("disabled_for_quota")),
+        }
+        # Convenience top-level mirrors for older UI.
+        out["pool_status"] = out["pool"]["pool_status"]
+        out["in_cooldown"] = out["pool"]["in_cooldown"]
+        out["cooldown_count"] = out["pool"]["cooldown_count"]
+    except Exception:
+        pass
+    return out
 
 
 @router.post("/accounts/{account_id:path}/probe")
@@ -1032,7 +1783,67 @@ async def account_probe(
         raise HTTPException(status_code=404, detail=str(e)) from e
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(e)[:400]) from e
-    return result
+    return _probe_result_with_pool(account_id, result if isinstance(result, dict) else {"ok": False})
+
+
+@router.post("/accounts/probe-batch")
+async def accounts_probe_batch(
+    body: AccountProbeBatchBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Probe selected accounts; return per-account results + durable pool status."""
+    require_admin(request, x_admin_token)
+    ids = [str(x).strip() for x in (body.ids or []) if str(x).strip()]
+    if not ids:
+        raise HTTPException(status_code=400, detail="ids is empty")
+    if len(ids) > 500:
+        raise HTTPException(status_code=400, detail="too many ids (max 500)")
+    model = resolve_model(body.model) if body.model else None
+
+    def _run() -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for aid in ids:
+            try:
+                r = model_health.probe_single_account(
+                    aid,
+                    model,
+                    auto_disable=body.auto_disable,
+                    source="manual_batch",
+                )
+                out.append(_probe_result_with_pool(aid, r if isinstance(r, dict) else {"ok": False}))
+            except Exception as e:  # noqa: BLE001
+                out.append(
+                    _probe_result_with_pool(
+                        aid,
+                        {
+                            "ok": False,
+                            "account_id": aid,
+                            "error": str(e)[:300],
+                            "result": {"available": False, "error": str(e)[:300]},
+                        },
+                    )
+                )
+        return out
+
+    results = await asyncio.to_thread(_run)
+    ok_n = sum(1 for r in results if r.get("ok"))
+    cool_n = sum(1 for r in results if (r.get("pool") or {}).get("in_cooldown"))
+    audit_log(
+        request,
+        action="accounts.probe_batch",
+        summary=f"批量模型探测：成功 {ok_n}/{len(results)} · 冷却 {cool_n}",
+        target_type="pool",
+        detail={"count": len(results), "ok": ok_n, "cooldown": cool_n},
+    )
+    return {
+        "ok": True,
+        "count": len(results),
+        "available_count": ok_n,
+        "unavailable_count": len(results) - ok_n,
+        "cooldown_count": cool_n,
+        "results": results,
+    }
 
 
 @router.post("/accounts/probe-all")
@@ -1042,7 +1853,23 @@ async def accounts_probe_all(
 ):
     """Run model probe for every live account (same as background cycle)."""
     require_admin(request, x_admin_token)
-    return await asyncio.to_thread(model_health.run_once, source="manual_all")
+    result = await asyncio.to_thread(model_health.run_once, source="manual_all")
+    audit_log(
+        request,
+        action="accounts.probe_all",
+        summary=(
+            f"全部模型探测：可用 {result.get('available_count')}/{result.get('count')}"
+            if isinstance(result, dict) else "全部模型探测"
+        ),
+        target_type="pool",
+        detail={
+            "count": (result or {}).get("count") if isinstance(result, dict) else None,
+            "available_count": (result or {}).get("available_count") if isinstance(result, dict) else None,
+            "unavailable_count": (result or {}).get("unavailable_count") if isinstance(result, dict) else None,
+            "auto_action_count": (result or {}).get("auto_action_count") if isinstance(result, dict) else None,
+        },
+    )
+    return result
 
 
 @router.get("/model-health")
@@ -1059,20 +1886,208 @@ async def account_quota(
     account_id: str,
     request: Request,
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    cached: bool = False,
+    refresh: bool = False,
 ):
-    """Query billing quota for one account."""
-    require_admin(request, x_admin_token)
-    try:
-        from auth import load_credentials_by_id
+    """Query billing quota for one account.
 
-        creds = load_credentials_by_id(account_id)
+    cached=1 returns last_quota from DB when present; otherwise falls back to live query.
+    """
+    require_admin(request, x_admin_token)
+    if cached and not refresh:
+        try:
+            import account_pool
+            for a in account_pool.list_pool_accounts():
+                if a.get("id") == account_id and isinstance(a.get("last_quota"), dict):
+                    q = dict(a["last_quota"])
+                    q.setdefault("account_id", account_id)
+                    q.setdefault("email", a.get("email"))
+                    q["cached"] = True
+                    q["pool_disabled"] = bool(a.get("disabled_for_quota") or a.get("enabled") is False)
+                    if not q.get("display") and q.get("summary"):
+                        q["display"] = {"summary": q.get("summary")}
+                    return q
+        except Exception:
+            pass
+    try:
+        # Prefer shared helper (handles id alias / remount / refresh).
+        result = await asyncio.to_thread(quota.fetch_quota_by_account_id, account_id)
     except AuthError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
-    result = await quota.fetch_quota_for_creds_async(creds)
-    if not result.get("ok"):
-        # still return payload so UI can show the error
-        return result
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"quota query failed: {e}") from e
     return result
+
+
+
+
+
+@router.post("/accounts/{account_id:path}/cooldown/clear")
+async def clear_account_cooldown_route(
+    account_id: str,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Clear cooldown so account re-enters rotation immediately."""
+    require_admin(request, x_admin_token)
+    rec = account_pool.clear_account_cooldown(account_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="account not found")
+    audit_log(
+        request,
+        action="accounts.cooldown_clear",
+        summary=f"清除冷却：{account_id}",
+        target_type="account",
+        target_id=account_id,
+    )
+    return {"ok": True, "account": rec}
+
+
+@router.post("/accounts/{account_id:path}/kick")
+async def kick_account_route(
+    account_id: str,
+    body: KickAccountBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Kick account from rotation: temporary cooldown or hard disable."""
+    require_admin(request, x_admin_token)
+    rec = account_pool.kick_from_pool(
+        account_id,
+        reason=body.reason,
+        cooldown_sec=body.cooldown_sec,
+    )
+    if rec is None:
+        raise HTTPException(status_code=404, detail="account not found")
+    audit_log(
+        request,
+        action="accounts.cooldown",
+        summary=f"账号进入冷却：{account_id}",
+        target_type="account",
+        target_id=account_id,
+        detail={"reason": body.reason, "cooldown_sec": body.cooldown_sec},
+    )
+    return {"ok": True, "account": rec}
+
+
+@router.post("/accounts/model-blocks/prune")
+async def prune_model_blocks_route(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Drop expired soft model blocks across the pool."""
+    require_admin(request, x_admin_token)
+    n = account_pool.prune_expired_model_blocks()
+    return {"ok": True, "removed": n}
+
+
+@router.get("/settings")
+async def get_settings(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Full public settings payload for the system settings page."""
+    require_admin(request, x_admin_token)
+    return {"ok": True, "settings": get_public_settings()}
+
+
+@router.put("/settings")
+async def put_settings(
+    body: RuntimeSettingsBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Update one or more runtime settings from admin UI."""
+    require_admin(request, x_admin_token)
+    patch = body.model_dump(exclude_unset=True)
+    if not patch:
+        raise HTTPException(status_code=400, detail="没有可更新的字段")
+    try:
+        settings = update_runtime_settings(patch)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    audit_log(
+        request,
+        action="settings.update",
+        summary="更新系统设置",
+        target_type="settings",
+        detail={"keys": sorted(list(patch.keys()))[:40]},
+    )
+    return {"ok": True, "settings": settings}
+
+
+@router.put("/settings/password")
+async def put_admin_password(
+    body: ChangePasswordBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Change admin password (requires current password)."""
+    require_admin(request, x_admin_token)
+    new_pw = body.new_password
+    if body.confirm_password is not None and body.confirm_password != new_pw:
+        raise HTTPException(status_code=400, detail="两次输入的新密码不一致")
+    try:
+        change_admin_password(current=body.current_password, new_password=new_pw)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    audit_log(request, action="settings.password_change", summary="修改管理员密码", target_type="settings")
+    return {
+        "ok": True,
+        "message": "密码已更新",
+        "settings": get_public_settings(),
+    }
+
+
+@router.put("/settings/token-maintain")
+async def set_token_maintain(
+    body: FeatureToggleBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Enable/disable background Token auto-renewal worker."""
+    require_admin(request, x_admin_token)
+    enabled = set_token_maintain_enabled(bool(body.enabled))
+    audit_log(
+        request,
+        action="settings.token_maintain",
+        summary=f"Token 自动续期：{'开启' if enabled else '关闭'}",
+        target_type="settings",
+        detail={"enabled": bool(enabled)},
+    )
+
+    return {
+        "ok": True,
+        "token_maintain_enabled": enabled,
+        "settings": {"token_maintain_enabled": enabled},
+        "maintainer": token_maintainer.status(light=True),
+        "token_maintainer": token_maintainer.status(light=True),
+    }
+
+
+@router.put("/settings/model-health")
+async def set_model_health_flag(
+    body: FeatureToggleBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Enable/disable background model health probe worker."""
+    require_admin(request, x_admin_token)
+    enabled = set_model_health_enabled(bool(body.enabled))
+    audit_log(
+        request,
+        action="settings.model_health",
+        summary=f"模型健康探测：{'开启' if enabled else '关闭'}",
+        target_type="settings",
+        detail={"enabled": bool(enabled)},
+    )
+
+    return {
+        "ok": True,
+        "model_health_enabled": enabled,
+        "settings": {"model_health_enabled": enabled},
+        "model_health": model_health.status(light=True),
+    }
 
 
 @router.put("/settings/account-mode")
@@ -1119,7 +2134,30 @@ async def refresh_accounts(
         token_maintainer.request_run_soon()
     except Exception:
         pass
-    result["maintainer"] = token_maintainer.status()
+    # Prefer maintainer cycle summary when available for overview widgets.
+    try:
+        result["maintainer"] = token_maintainer.status(light=True)
+        result["token_maintainer"] = result["maintainer"]
+    except Exception:
+        result["maintainer"] = token_maintainer.status()
+        result["token_maintainer"] = result["maintainer"]
+    # Normalize common fields for frontend overview text.
+    if isinstance(result, dict):
+        if "refresh" not in result:
+            result["refresh"] = {
+                "refreshed": result.get("refreshed"),
+                "attempted": result.get("attempted"),
+                "failed": result.get("failed"),
+                "skipped": result.get("skipped"),
+                "deferred": result.get("deferred"),
+            }
+        audit_log(
+            request,
+            action="accounts.refresh",
+            summary=f"Token 续期{'（强制）' if force else ''}：刷新 {result.get('refreshed') or (result.get('refresh') or {}).get('refreshed') or 0}",
+            target_type="pool",
+            detail=result.get("refresh") if isinstance(result.get("refresh"), dict) else None,
+        )
     return result
 
 
@@ -1145,6 +2183,13 @@ async def maintainer_run(
     require_admin(request, x_admin_token)
     force = True if body is None else bool(body.force)
     result = token_maintainer.run_once(force=force)
+    audit_log(
+        request,
+        action="accounts.refresh",
+        summary=f"Token 续期{'（强制）' if force else ''}",
+        target_type="pool",
+        detail=(result.get("refresh") if isinstance(result, dict) else None),
+    )
     return result
 
 
@@ -1181,4 +2226,45 @@ async def models_sync(
     result = sync_models_from_upstream()
     if not result.get("ok"):
         raise HTTPException(status_code=502, detail=result.get("error") or "sync failed")
+    audit_log(
+        request,
+        action="models.sync",
+        summary=f"同步上游模型 {result.get('count') or ''}",
+        target_type="models",
+        detail={"count": result.get("count")},
+    )
     return result
+
+
+
+@router.get("/logs")
+async def list_admin_logs(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    page: int = 1,
+    page_size: int = 50,
+    q: str = "",
+    action: str = "",
+):
+    """Query admin operation logs (PostgreSQL)."""
+    require_admin(request, x_admin_token)
+    try:
+        from store.audit_pg import list_logs
+
+        return list_logs(q=q, action=action, page=page, page_size=page_size)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"logs query failed: {e}") from e
+
+
+@router.get("/logs/actions")
+async def list_admin_log_actions(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    require_admin(request, x_admin_token)
+    try:
+        from store.audit_pg import list_actions
+
+        return {"ok": True, "actions": list_actions()}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(e)[:300]) from e

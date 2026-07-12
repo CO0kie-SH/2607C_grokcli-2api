@@ -336,6 +336,33 @@ def anthropic_messages_to_openai(
     return out
 
 
+def _empty_tool_parameters() -> dict[str, Any]:
+    return {"type": "object", "properties": {}}
+
+
+def _ensure_tool_parameters(params: Any) -> dict[str, Any]:
+    """Always produce a JSON-schema object for function.parameters."""
+    if params is None:
+        return _empty_tool_parameters()
+    if isinstance(params, str):
+        text = params.strip()
+        if not text:
+            return _empty_tool_parameters()
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return _empty_tool_parameters()
+        return _ensure_tool_parameters(parsed)
+    if not isinstance(params, dict):
+        return _empty_tool_parameters()
+    out = dict(params)
+    if "type" not in out:
+        out["type"] = "object"
+    if out.get("type") == "object" and "properties" not in out:
+        out["properties"] = {}
+    return out
+
+
 def anthropic_tools_to_openai(tools: list[Any] | None) -> list[dict[str, Any]] | None:
     if not tools:
         return None
@@ -345,7 +372,23 @@ def anthropic_tools_to_openai(tools: list[Any] | None) -> list[dict[str, Any]] |
             continue
         # Already OpenAI shape
         if isinstance(t.get("function"), dict):
-            out.append(t)
+            fn = dict(t["function"])
+            name = fn.get("name") or t.get("name")
+            if not name:
+                continue
+            fn["name"] = name
+            raw = (
+                fn.get("parameters")
+                if fn.get("parameters") is not None
+                else fn.get("input_schema")
+                if fn.get("input_schema") is not None
+                else t.get("parameters")
+                if t.get("parameters") is not None
+                else t.get("input_schema")
+            )
+            fn["parameters"] = _ensure_tool_parameters(raw)
+            fn.pop("input_schema", None)
+            out.append({"type": "function", "function": fn})
             continue
         name = t.get("name")
         if not name:
@@ -358,8 +401,7 @@ def anthropic_tools_to_openai(tools: list[Any] | None) -> list[dict[str, Any]] |
             if t.get("input_schema") is not None
             else t.get("parameters")
         )
-        if schema is not None:
-            fn["parameters"] = schema
+        fn["parameters"] = _ensure_tool_parameters(schema)
         out.append({"type": "function", "function": fn})
     return out or None
 
@@ -987,6 +1029,7 @@ class AnthropicStreamAssembler:
         message_id: str,
         model: str,
         tools_requested: bool = False,
+        max_tools: int | None = None,
     ) -> None:
         self.message_id = message_id
         self.model = model
@@ -1002,6 +1045,25 @@ class AnthropicStreamAssembler:
         # Held (content, reasoning) pairs while waiting to learn if tools win.
         self._held_pre_tool: list[tuple[str | None, str | None]] = []
         self._output_chars = 0
+        # Cap outbound tool_use blocks (sub2api single-active-block safety).
+        # None → read history_compact.OUTBOUND_MAX_TOOLS at first use.
+        self._max_tools = max_tools
+        self._tools_started_count = 0
+
+    def _tool_budget_left(self) -> int | None:
+        """How many more tool_use blocks may start. None = unlimited."""
+        max_tools = self._max_tools
+        if max_tools is None:
+            try:
+                import history_compact
+
+                max_tools = int(getattr(history_compact, "OUTBOUND_MAX_TOOLS", 1) or 0)
+            except Exception:
+                max_tools = 1
+            self._max_tools = max_tools
+        if max_tools is None or int(max_tools) <= 0:
+            return None
+        return max(0, int(max_tools) - self._tools_started_count)
 
     def start(self, input_tokens: int = 0) -> list[str]:
         self._started = True
@@ -1299,9 +1361,14 @@ class AnthropicStreamAssembler:
                         for s in self._tools.values()
                     ):
                         break
+                    budget = self._tool_budget_left()
+                    if budget is not None and budget <= 0:
+                        # Cap reached — leave remaining tools unstarted this turn.
+                        break
                     state["block_index"] = self._next_index
                     self._next_index += 1
                     state["started"] = True
+                    self._tools_started_count += 1
                     self._saw_tool = True
                     # Tools confirmed on the wire — drop held thinking/text preface.
                     if self._held_pre_tool:
@@ -1401,12 +1468,17 @@ class AnthropicStreamAssembler:
                     )
                 ):
                     continue
+                budget = self._tool_budget_left()
+                if budget is not None and budget <= 0:
+                    # Drop remaining tools rather than open concurrent blocks.
+                    continue
                 # Close any still-open prior tool before opening this one.
                 events.extend(self._close_tools())
                 if state.get("block_index") is None:
                     state["block_index"] = self._next_index
                     self._next_index += 1
                 state["started"] = True
+                self._tools_started_count += 1
                 self._saw_tool = True
                 if self._held_pre_tool:
                     self._held_pre_tool.clear()

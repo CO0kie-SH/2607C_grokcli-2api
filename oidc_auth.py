@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import threading
 import time
 import uuid
@@ -16,15 +17,60 @@ from datetime import datetime, timezone
 from typing import Any
 import httpx
 
-from auth_store import mutate_auth_map, read_auth_map, write_auth_map
+from auth_store import mutate_auth_map, read_auth_map, upsert_auth_entry, write_auth_map
 from config import GROK_CLI_CLIENT_ID, OIDC_DEVICE_URL, OIDC_SCOPES, OIDC_TOKEN_URL
 
-# In-memory device sessions (server-side poll)
+# In-memory device sessions (server-side poll). When Redis is on, also mirrored
+# so other workers can poll status for multi-worker admin UX.
 _lock = threading.RLock()
 _device_sessions: dict[str, dict[str, Any]] = {}
 # Serialize refresh for same account (avoid parallel refresh_token races)
 _refresh_locks: dict[str, threading.Lock] = {}
 _refresh_locks_guard = threading.Lock()
+
+
+def _device_redis() -> bool:
+    try:
+        from store.redis_client import redis_enabled
+
+        return redis_enabled()
+    except Exception:
+        return False
+
+
+def _device_mirror(session_id: str, sess: dict[str, Any] | None) -> None:
+    if not _device_redis() or not session_id:
+        return
+    try:
+        from store import sessions_redis
+
+        if sess is None:
+            sessions_redis.device_delete(session_id)
+        else:
+            sessions_redis.device_put(session_id, sess)
+    except Exception:
+        pass
+
+
+def _device_load(session_id: str) -> dict[str, Any] | None:
+    with _lock:
+        local = _device_sessions.get(session_id)
+        if local is not None:
+            return local
+    if not _device_redis():
+        return None
+    try:
+        from store import sessions_redis
+
+        remote = sessions_redis.device_get(session_id)
+        if remote:
+            with _lock:
+                # Cache remotely-created sessions locally for the poll worker.
+                _device_sessions.setdefault(session_id, remote)
+            return remote
+    except Exception:
+        pass
+    return None
 
 
 def _b64url_json(segment: str) -> dict[str, Any]:
@@ -188,32 +234,12 @@ def upsert_entry(account_id: str, entry: dict[str, Any], *, merge_same_user: boo
     Save one account. If another key holds the same user_id, replace/remove it
     so we never keep duplicate tokens for the same person.
     Multi-account safe: keys are per-user (issuer::user_id), not client_id slot.
+
+    On PostgreSQL this is a row-level UPSERT (not a full-table rewrite).
     """
-
-    def _mut(data: dict[str, Any]) -> None:
-        uid = entry.get("user_id") or entry.get("principal_id")
-        token = entry.get("key")
-        if merge_same_user:
-            for k in list(data.keys()):
-                if k == account_id:
-                    continue
-                v = data.get(k)
-                if not isinstance(v, dict):
-                    continue
-                same_user = bool(
-                    uid
-                    and (
-                        v.get("user_id") == uid
-                        or v.get("principal_id") == uid
-                    )
-                )
-                same_token = bool(token and v.get("key") == token)
-                if same_user or same_token:
-                    del data[k]
-        data[account_id] = entry
-
-    mutate_auth_map(_mut)
-    return account_id
+    return upsert_auth_entry(
+        account_id, entry, merge_same_user=merge_same_user
+    )
 
 
 def normalize_auth_file_keys() -> dict[str, Any]:
@@ -491,8 +517,10 @@ def start_device_authorization(
     }
     with _lock:
         _device_sessions[session_id] = sess
+    _device_mirror(session_id, sess)
 
-    # background poller
+    # background poller (must run on the worker that created the session —
+    # other workers only read mirrored status from Redis)
     t = threading.Thread(target=_device_poll_worker, args=(session_id,), daemon=True)
     t.start()
 
@@ -511,6 +539,17 @@ def start_device_authorization(
     }
 
 
+def _device_update(session_id: str, **fields: Any) -> dict[str, Any] | None:
+    with _lock:
+        sess = _device_sessions.get(session_id)
+        if not sess:
+            return None
+        sess.update(fields)
+        snap = dict(sess)
+    _device_mirror(session_id, snap)
+    return snap
+
+
 def _device_poll_worker(session_id: str) -> None:
     while True:
         with _lock:
@@ -522,6 +561,8 @@ def _device_poll_worker(session_id: str) -> None:
                 sess["error"] = "device code expired"
                 sess["message"] = "设备码已过期，请重新发起登录"
                 sess["finished_at"] = time.time()
+                snap = dict(sess)
+                _device_mirror(session_id, snap)
                 return
             device_code = sess["device_code"]
             client_id = sess["client_id"]
@@ -545,10 +586,7 @@ def _device_poll_worker(session_id: str) -> None:
                 except Exception:
                     body = {}
         except Exception as e:  # noqa: BLE001
-            with _lock:
-                sess = _device_sessions.get(session_id)
-                if sess:
-                    sess["message"] = f"轮询网络异常，重试中: {e}"
+            _device_update(session_id, message=f"轮询网络异常，重试中: {e}")
             time.sleep(interval)
             continue
 
@@ -585,44 +623,42 @@ def _device_poll_worker(session_id: str) -> None:
                         sess["email"] = entry.get("email")
                         sess["finished_at"] = time.time()
                         sess["output"] = (sess.get("output") or "") + "\n" + body_text[:500]
+                        _device_mirror(session_id, dict(sess))
             except Exception as e:  # noqa: BLE001
-                with _lock:
-                    sess = _device_sessions.get(session_id)
-                    if sess:
-                        sess["status"] = "error"
-                        sess["error"] = str(e)
-                        sess["message"] = f"保存凭证失败: {e}"
-                        sess["finished_at"] = time.time()
+                _device_update(
+                    session_id,
+                    status="error",
+                    error=str(e),
+                    message=f"保存凭证失败: {e}",
+                    finished_at=time.time(),
+                )
             return
 
         if err in ("authorization_pending", "slow_down"):
             if err == "slow_down":
                 interval = min(interval + 5, 30)
-                with _lock:
-                    sess = _device_sessions.get(session_id)
-                    if sess:
-                        sess["interval"] = interval
+                _device_update(session_id, interval=interval)
             time.sleep(interval)
             continue
 
         if err == "expired_token":
-            with _lock:
-                sess = _device_sessions.get(session_id)
-                if sess:
-                    sess["status"] = "expired"
-                    sess["error"] = err
-                    sess["message"] = "设备码已过期，请重新发起登录"
-                    sess["finished_at"] = time.time()
+            _device_update(
+                session_id,
+                status="expired",
+                error=err,
+                message="设备码已过期，请重新发起登录",
+                finished_at=time.time(),
+            )
             return
 
         if err in ("access_denied", "access_denied"):
-            with _lock:
-                sess = _device_sessions.get(session_id)
-                if sess:
-                    sess["status"] = "error"
-                    sess["error"] = err
-                    sess["message"] = "用户拒绝授权"
-                    sess["finished_at"] = time.time()
+            _device_update(
+                session_id,
+                status="error",
+                error=err,
+                message="用户拒绝授权",
+                finished_at=time.time(),
+            )
             return
 
         # other errors
@@ -635,35 +671,37 @@ def _device_poll_worker(session_id: str) -> None:
                     sess["error"] = f"{err}: {body.get('error_description') or body_text[:200]}"
                     sess["message"] = sess["error"]
                     sess["finished_at"] = time.time()
+                    _device_mirror(session_id, dict(sess))
                     return
                 sess["message"] = f"等待授权… ({resp.status_code})"
+                _device_mirror(session_id, dict(sess))
         time.sleep(interval)
 
 
 def get_device_session(session_id: str) -> dict[str, Any] | None:
-    with _lock:
-        sess = _device_sessions.get(session_id)
-        if not sess:
-            return None
-        return {
-            "session_id": sess["id"],
-            "mode": sess.get("mode"),
-            "status": sess.get("status"),
-            "user_code": sess.get("user_code"),
-            "verification_url": sess.get("verification_url"),
-            "message": sess.get("message"),
-            "error": sess.get("error"),
-            "output_tail": (sess.get("output") or "")[-2000:],
-            "started_at": sess.get("started_at"),
-            "finished_at": sess.get("finished_at"),
-            "account_id": sess.get("account_id"),
-            "email": sess.get("email"),
-            "ok": sess.get("status") in ("running", "waiting_user", "success"),
-            "native_oidc": True,
-        }
+    sess = _device_load(session_id)
+    if not sess:
+        return None
+    return {
+        "session_id": sess.get("id") or session_id,
+        "mode": sess.get("mode"),
+        "status": sess.get("status"),
+        "user_code": sess.get("user_code"),
+        "verification_url": sess.get("verification_url"),
+        "message": sess.get("message"),
+        "error": sess.get("error"),
+        "output_tail": (sess.get("output") or "")[-2000:],
+        "started_at": sess.get("started_at"),
+        "finished_at": sess.get("finished_at"),
+        "account_id": sess.get("account_id"),
+        "email": sess.get("email"),
+        "ok": sess.get("status") in ("running", "waiting_user", "success"),
+        "native_oidc": True,
+    }
 
 
 def list_device_sessions() -> list[dict[str, Any]]:
+    ids: list[str] = []
     with _lock:
         now = time.time()
         dead = [
@@ -673,7 +711,145 @@ def list_device_sessions() -> list[dict[str, Any]]:
         ]
         for k in dead:
             _device_sessions.pop(k, None)
-        return [get_device_session(k) for k in list(_device_sessions.keys()) if get_device_session(k)]
+            _device_mirror(k, None)
+        ids = list(_device_sessions.keys())
+    if _device_redis():
+        try:
+            from store import sessions_redis
+
+            for sid, _ in sessions_redis.device_list():
+                if sid not in ids:
+                    ids.append(sid)
+        except Exception:
+            pass
+    out: list[dict[str, Any]] = []
+    for k in ids:
+        item = get_device_session(k)
+        if item:
+            out.append(item)
+    return out
+
+
+# Strict non-repeat sweep for background token refresh (shared via Redis).
+_REFRESH_SWEEP_META = ("token_refresh", "sweep", "meta")
+_REFRESH_SWEEP_COVERED = ("token_refresh", "sweep", "covered")
+_REFRESH_SWEEP_TTL = 6 * 3600
+_local_refresh_sweep: dict[str, Any] = {
+    "generation": 0,
+    "started_at": 0.0,
+    "covered": set(),
+}
+_refresh_sweep_lock = threading.RLock()
+
+
+def _refresh_sweep_ttl() -> int:
+    try:
+        interval = float(os.getenv("GROK2API_TOKEN_MAINTAIN_INTERVAL", "180") or 180)
+    except Exception:
+        interval = 180.0
+    return max(int(_REFRESH_SWEEP_TTL), int(max(60.0, interval) * 40))
+
+
+def _refresh_sweep_load() -> tuple[int, set[str], float]:
+    try:
+        from store.redis_client import get_str, key, redis_enabled, smembers
+
+        if redis_enabled():
+            meta_raw = get_str(key(*_REFRESH_SWEEP_META)) or ""
+            gen = 0
+            started = 0.0
+            if meta_raw:
+                parts = str(meta_raw).split("|", 1)
+                try:
+                    gen = int(parts[0] or 0)
+                except (TypeError, ValueError):
+                    gen = 0
+                if len(parts) > 1:
+                    try:
+                        started = float(parts[1] or 0)
+                    except (TypeError, ValueError):
+                        started = 0.0
+            return gen, smembers(key(*_REFRESH_SWEEP_COVERED)), started
+    except Exception:
+        pass
+    with _refresh_sweep_lock:
+        return (
+            int(_local_refresh_sweep.get("generation") or 0),
+            set(_local_refresh_sweep.get("covered") or set()),
+            float(_local_refresh_sweep.get("started_at") or 0.0),
+        )
+
+
+def _refresh_sweep_start_new() -> tuple[int, set[str], float]:
+    now = time.time()
+    gen = int(now)
+    try:
+        from store.redis_client import delete, key, redis_enabled, set_ex
+
+        if redis_enabled():
+            delete(key(*_REFRESH_SWEEP_COVERED))
+            set_ex(key(*_REFRESH_SWEEP_META), f"{gen}|{now}", _refresh_sweep_ttl())
+            with _refresh_sweep_lock:
+                _local_refresh_sweep["generation"] = gen
+                _local_refresh_sweep["started_at"] = now
+                _local_refresh_sweep["covered"] = set()
+            return gen, set(), now
+    except Exception:
+        pass
+    with _refresh_sweep_lock:
+        _local_refresh_sweep["generation"] = gen
+        _local_refresh_sweep["started_at"] = now
+        _local_refresh_sweep["covered"] = set()
+        return gen, set(), now
+
+
+def _refresh_sweep_mark(ids: list[str]) -> int:
+    ids = [str(x) for x in ids if x]
+    if not ids:
+        try:
+            from store.redis_client import key, redis_enabled, scard
+
+            if redis_enabled():
+                return scard(key(*_REFRESH_SWEEP_COVERED))
+        except Exception:
+            pass
+        with _refresh_sweep_lock:
+            return len(_local_refresh_sweep.get("covered") or set())
+    try:
+        from store.redis_client import (
+            expire,
+            get_str,
+            key,
+            redis_enabled,
+            sadd,
+            scard,
+            set_ex,
+        )
+
+        if redis_enabled():
+            meta = get_str(key(*_REFRESH_SWEEP_META))
+            if not meta:
+                _refresh_sweep_start_new()
+            else:
+                set_ex(key(*_REFRESH_SWEEP_META), meta, _refresh_sweep_ttl())
+            sadd(key(*_REFRESH_SWEEP_COVERED), *ids, ttl_sec=_refresh_sweep_ttl())
+            expire(key(*_REFRESH_SWEEP_COVERED), _refresh_sweep_ttl())
+            with _refresh_sweep_lock:
+                cov = _local_refresh_sweep.setdefault("covered", set())
+                if not isinstance(cov, set):
+                    cov = set()
+                    _local_refresh_sweep["covered"] = cov
+                cov.update(ids)
+            return scard(key(*_REFRESH_SWEEP_COVERED))
+    except Exception:
+        pass
+    with _refresh_sweep_lock:
+        cov = _local_refresh_sweep.setdefault("covered", set())
+        if not isinstance(cov, set):
+            cov = set()
+            _local_refresh_sweep["covered"] = cov
+        cov.update(ids)
+        return len(cov)
 
 
 def refresh_all_accounts(
@@ -683,6 +859,7 @@ def refresh_all_accounts(
     max_workers: int | None = None,
     max_accounts: int | None = None,
     account_ids: list[str] | None = None,
+    strict_sweep: bool | None = None,
 ) -> dict[str, Any]:
     """
     Refresh accounts that have refresh_token (optionally only near expiry).
@@ -693,6 +870,9 @@ def refresh_all_accounts(
       - single batched auth.json write at the end (not one rewrite per account)
       - optional max_accounts cap so a cycle never tries all 700 at once
       - optional account_ids to refresh only selected accounts
+      - strict_sweep (default on for background batch): each needing-refresh
+        account is attempted at most once per sweep generation, so permanent
+        failures cannot starve the rest of the pool forever
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -708,6 +888,9 @@ def refresh_all_accounts(
         # Selected-account renew should not be silently truncated by the
         # background batch cap used for full-pool maintenance.
         max_accounts = None if account_ids else TOKEN_REFRESH_BATCH
+    # Strict sweep only for background pool maintenance (batch-capped, not selected).
+    if strict_sweep is None:
+        strict_sweep = bool(account_ids is None and max_accounts)
 
     data = read_auth_map()
     results: list[dict[str, Any]] = []
@@ -773,18 +956,62 @@ def refresh_all_accounts(
 
     candidates.sort(key=_exp_key)
     deferred = 0
+    sweep_info: dict[str, Any] | None = None
     if max_accounts and len(candidates) > max_accounts:
-        deferred = len(candidates) - max_accounts
-        for aid, _ in candidates[max_accounts:]:
-            results.append(
-                {
-                    "id": aid,
-                    "ok": True,
-                    "skipped": True,
-                    "reason": "batch_deferred",
-                }
-            )
-        candidates = candidates[:max_accounts]
+        if strict_sweep:
+            cand_ids = [aid for aid, _ in candidates]
+            cand_set = set(cand_ids)
+            gen, covered, started = _refresh_sweep_load()
+            if gen <= 0:
+                gen, covered, started = _refresh_sweep_start_new()
+            covered = {x for x in covered if x in cand_set}
+            remaining = [(aid, e) for aid, e in candidates if aid not in covered]
+            reset = False
+            if not remaining:
+                # All current need-refresh accounts already attempted this sweep
+                # → new generation so permanent failures get another chance later,
+                # after everyone else had a turn.
+                gen, covered, started = _refresh_sweep_start_new()
+                remaining = list(candidates)
+                reset = True
+                print(
+                    f"  [token-refresh] sweep reset gen={gen} "
+                    f"need_refresh={len(candidates)} (previous generation fully covered)"
+                )
+            # Still prefer soonest-expiring among *uncovered* accounts.
+            remaining.sort(key=_exp_key)
+            deferred = max(0, len(remaining) - int(max_accounts))
+            for aid, _ in remaining[int(max_accounts) :]:
+                results.append(
+                    {
+                        "id": aid,
+                        "ok": True,
+                        "skipped": True,
+                        "reason": "batch_deferred",
+                    }
+                )
+            candidates = remaining[: int(max_accounts)]
+            sweep_info = {
+                "mode": "strict_sweep",
+                "generation": gen,
+                "covered": len(covered),
+                "need_refresh": len(cand_ids),
+                "remaining": deferred,
+                "started_at": started or None,
+                "reset": reset,
+            }
+        else:
+            deferred = len(candidates) - max_accounts
+            for aid, _ in candidates[max_accounts:]:
+                results.append(
+                    {
+                        "id": aid,
+                        "ok": True,
+                        "skipped": True,
+                        "reason": "batch_deferred",
+                    }
+                )
+            candidates = candidates[:max_accounts]
 
     updates: dict[str, dict[str, Any]] = {}
     invalid_marks: dict[str, str] = {}
@@ -862,11 +1089,32 @@ def refresh_all_accounts(
                         pass
                 _clients.clear()
 
-    # Single batched write for successful refreshes + permanent invalid marks.
-    if updates or invalid_marks:
+    # Permanent refresh failures: delete the account entirely (auth store + pool).
+    # Temporary failures only keep the account; successful refreshes update tokens.
+    deleted_ids: list[str] = []
+    deleted_reasons: dict[str, str] = {}
+    if invalid_marks:
+        for aid, reason in invalid_marks.items():
+            deleted_ids.append(aid)
+            deleted_reasons[aid] = reason
+            # Rewrite result rows so admin UI shows deletion, not "marked invalid".
+            for r in results:
+                if r.get("id") == aid and (
+                    r.get("permanent") or r.get("reason") == "refresh_invalid"
+                ):
+                    r["deleted"] = True
+                    r["reason"] = "refresh_invalid_deleted"
+                    r["error"] = (reason or r.get("error") or "refresh_token permanently invalid")[:300]
+
+    # Single batched write for successful refreshes + permanent deletions.
+    if updates or deleted_ids:
+        delete_set = set(deleted_ids)
+
         def _apply(m: dict[str, Any]) -> None:
             for aid, entry in updates.items():
                 if aid == "__delete__" or not isinstance(entry, dict):
+                    continue
+                if aid in delete_set:
                     continue
                 # remove any other keys with same user_id / token to avoid dupes
                 uid = entry.get("user_id") or entry.get("principal_id")
@@ -885,15 +1133,17 @@ def refresh_all_accounts(
                     if same_user or same_token:
                         del m[k]
                 m[aid] = entry
-            for aid, reason in invalid_marks.items():
-                cur = m.get(aid)
-                if not isinstance(cur, dict):
-                    continue
-                cur = dict(cur)
-                cur["refresh_invalid"] = True
-                cur["refresh_invalid_at"] = time.time()
-                cur["refresh_invalid_reason"] = reason[:300]
-                m[aid] = cur
+            # Drop permanently invalid refresh-token accounts completely.
+            for aid in delete_set:
+                if aid in m:
+                    del m[aid]
+                # Also drop any remounted key that shares the same storage id tail.
+                for k in list(m.keys()):
+                    if k == aid:
+                        continue
+                    if k.endswith(aid) or aid.endswith(k):
+                        # be conservative: only exact match already handled
+                        pass
 
         try:
             mutate_auth_map(_apply)
@@ -906,7 +1156,48 @@ def refresh_all_accounts(
                 "deferred": deferred,
                 "attempted": len(candidates),
                 "invalidated": len(invalid_marks),
+                "deleted": 0,
             }
+
+        # Best-effort: clean pool meta / redis cooldown for deleted accounts.
+        if deleted_ids:
+            try:
+                from settings_store import get_account_pool_state, save_account_pool_state
+
+                state = get_account_pool_state()
+                changed = False
+                for aid in deleted_ids:
+                    if aid in state:
+                        state.pop(aid, None)
+                        changed = True
+                if changed:
+                    save_account_pool_state(state)
+            except Exception:
+                pass
+            for aid in deleted_ids:
+                try:
+                    from store.pool_redis import clear_cooldown
+
+                    clear_cooldown(aid)
+                except Exception:
+                    pass
+            print(
+                f"  [token-refresh] deleted {len(deleted_ids)} account(s) "
+                f"with permanently invalid refresh_token"
+            )
+
+    # Mark attempted accounts as covered for this sweep generation (success or fail).
+    # Permanent invalids are also covered so they don't monopolize every cycle;
+    # a new generation starts only after the rest of the need-refresh set had a turn.
+    if strict_sweep and candidates:
+        tried = [aid for aid, _ in candidates]
+        covered_total = _refresh_sweep_mark(tried)
+        if sweep_info is not None:
+            sweep_info["covered"] = covered_total
+            need_n = int(sweep_info.get("need_refresh") or 0)
+            if need_n:
+                sweep_info["remaining"] = max(0, need_n - covered_total)
+                deferred = int(sweep_info["remaining"])
 
     out = {
         "ok": True,
@@ -915,8 +1206,103 @@ def refresh_all_accounts(
         "deferred": deferred,
         "attempted": len(candidates),
         "workers": workers,
-        "invalidated": sum(1 for r in results if r.get("permanent") or r.get("reason") == "refresh_invalid"),
+        "invalidated": len(deleted_ids) or sum(
+            1 for r in results if r.get("permanent") or r.get("reason") in (
+                "refresh_invalid", "refresh_invalid_deleted"
+            )
+        ),
+        "deleted": len(deleted_ids),
+        "deleted_ids": deleted_ids[:50],
     }
+    if deleted_reasons:
+        out["deleted_sample"] = [
+            {"id": aid, "reason": (deleted_reasons.get(aid) or "")[:160]}
+            for aid in deleted_ids[:5]
+        ]
+    if sweep_info is not None:
+        out["sweep"] = sweep_info
     if wanted is not None:
         out["selected"] = len(wanted)
     return out
+
+
+def purge_refresh_invalid_accounts(*, dry_run: bool = False) -> dict[str, Any]:
+    """Delete all accounts already marked refresh_invalid (or equivalent).
+
+    Used once after upgrading from "mark invalid" → "delete permanently", and
+    can be re-run safely (idempotent).
+    """
+    data = read_auth_map()
+    doomed: list[tuple[str, str]] = []
+    for aid, entry in list(data.items()):
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("refresh_invalid"):
+            doomed.append(
+                (
+                    aid,
+                    str(entry.get("refresh_invalid_reason") or "refresh_invalid")[:300],
+                )
+            )
+            continue
+        # No refresh_token and no usable access token → dead weight
+        if not entry.get("refresh_token") and not entry.get("key"):
+            doomed.append((aid, "no_refresh_token_and_no_access_token"))
+
+    if dry_run:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "would_delete": len(doomed),
+            "ids": [a for a, _ in doomed[:100]],
+            "sample": [{"id": a, "reason": r[:160]} for a, r in doomed[:5]],
+        }
+    if not doomed:
+        return {"ok": True, "deleted": 0, "ids": []}
+
+    ids = [a for a, _ in doomed]
+    try:
+        from accounts import remove_accounts
+
+        result = remove_accounts(ids)
+        removed = list(result.get("removed") or ids)
+    except Exception:
+        # Fallback: direct map rewrite
+        def _apply(m: dict[str, Any]) -> None:
+            for aid in ids:
+                m.pop(aid, None)
+
+        mutate_auth_map(_apply)
+        removed = ids
+
+    # Pool / redis cleanup
+    try:
+        from settings_store import get_account_pool_state, save_account_pool_state
+
+        state = get_account_pool_state()
+        changed = False
+        for aid in removed:
+            if aid in state:
+                state.pop(aid, None)
+                changed = True
+        if changed:
+            save_account_pool_state(state)
+    except Exception:
+        pass
+    for aid in removed:
+        try:
+            from store.pool_redis import clear_cooldown
+
+            clear_cooldown(aid)
+        except Exception:
+            pass
+
+    print(
+        f"  [token-refresh] purged {len(removed)} permanently invalid account(s)"
+    )
+    return {
+        "ok": True,
+        "deleted": len(removed),
+        "ids": removed[:100],
+        "sample": [{"id": a, "reason": r[:160]} for a, r in doomed[:5]],
+    }

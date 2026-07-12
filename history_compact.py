@@ -47,9 +47,10 @@ HISTORY_MAX_TOOL_RESULT_CHARS = _env_int(
 HISTORY_MAX_MESSAGES_CHARS = _env_int(
     "GROK2API_HISTORY_MAX_MESSAGES_CHARS", 280_000, minimum=8_000, maximum=5_000_000
 )
-# Max tools per assistant turn. Default 1: sub2api/Claude Code only keep one active
-# content_block; multi-tool frames still race to "Content block not found".
-# Set 0 for unlimited (not recommended behind sub2api).
+# Max tools per assistant turn. Default 1: sub2api/Claude Code keep only one
+# active content_block; multi-tool frames still race to "Content block not found"
+# (especially Read) and agent frontends stop scheduling further turns.
+# Set higher only if the client is pure OpenAI; 0 = unlimited (not recommended).
 OUTBOUND_MAX_TOOLS = _env_int("GROK2API_OUTBOUND_MAX_TOOLS", 1, minimum=0, maximum=64)
 # Real wall-clock gap between consecutive outbound tool SSE frames (seconds).
 # SSE comment keepalives alone are not enough: sub2api often drains a TCP window

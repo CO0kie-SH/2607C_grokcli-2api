@@ -6,8 +6,30 @@ import os
 from pathlib import Path
 
 # Local server
-HOST = os.getenv("GROK2API_HOST", "127.0.0.1")
+HOST = os.getenv("GROK2API_HOST", "0.0.0.0")
 PORT = int(os.getenv("GROK2API_PORT", "3000"))
+
+
+def _default_workers() -> int:
+    """High-concurrency default: scale with CPU, min 2, max 8 (override via env)."""
+    raw = (os.getenv("GROK2API_WORKERS") or "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    try:
+        import os as _os
+
+        n = int(_os.cpu_count() or 2)
+    except Exception:
+        n = 2
+    # Leave a core for Redis/PG/OS; never default to single-worker.
+    return max(2, min(8, n))
+
+
+# Uvicorn worker processes (high-concurrency default). Requires Redis + PostgreSQL.
+WORKERS = _default_workers()
 # Optional public origin for admin UI / API guide links on public deployments.
 # Leave empty to auto-detect:
 #   - admin/API responses use request Host / X-Forwarded-* first
@@ -107,22 +129,21 @@ def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
 
 
 # Concurrent OIDC refresh / model probe / quota / SSO-import workers
-# Keep defaults modest so background work coexists with chat traffic on one
-# Uvicorn worker. Override upward only on hosts with spare CPU + bandwidth.
-TOKEN_REFRESH_WORKERS = _env_int("GROK2API_TOKEN_REFRESH_WORKERS", 2, maximum=16)
-MODEL_PROBE_WORKERS = _env_int("GROK2API_MODEL_PROBE_WORKERS", 2, maximum=16)
-QUOTA_WORKERS = _env_int("GROK2API_QUOTA_WORKERS", 3, maximum=16)
-SSO_IMPORT_WORKERS = _env_int("GROK2API_SSO_IMPORT_WORKERS", 3, maximum=16)
+# Higher defaults for multi-worker / large pools (override downward if needed).
+TOKEN_REFRESH_WORKERS = _env_int("GROK2API_TOKEN_REFRESH_WORKERS", 4, maximum=32)
+MODEL_PROBE_WORKERS = _env_int("GROK2API_MODEL_PROBE_WORKERS", 4, maximum=32)
+QUOTA_WORKERS = _env_int("GROK2API_QUOTA_WORKERS", 6, maximum=32)
+SSO_IMPORT_WORKERS = _env_int("GROK2API_SSO_IMPORT_WORKERS", 6, maximum=32)
 # Startup stagger: first background cycle waits longer with large pools
 TOKEN_MAINTAIN_STARTUP_DELAY = _env_float(
-    "GROK2API_TOKEN_MAINTAIN_STARTUP_DELAY", 45.0, minimum=5.0
+    "GROK2API_TOKEN_MAINTAIN_STARTUP_DELAY", 20.0, minimum=5.0
 )
 MODEL_HEALTH_STARTUP_DELAY = _env_float(
-    "GROK2API_MODEL_HEALTH_STARTUP_DELAY", 120.0, minimum=15.0
+    "GROK2API_MODEL_HEALTH_STARTUP_DELAY", 45.0, minimum=10.0
 )
 # Max accounts to refresh/probe per background cycle (rest deferred)
-TOKEN_REFRESH_BATCH = _env_int("GROK2API_TOKEN_REFRESH_BATCH", 20, maximum=500)
-MODEL_PROBE_BATCH = _env_int("GROK2API_MODEL_PROBE_BATCH", 15, maximum=500)
+TOKEN_REFRESH_BATCH = _env_int("GROK2API_TOKEN_REFRESH_BATCH", 40, maximum=500)
+MODEL_PROBE_BATCH = _env_int("GROK2API_MODEL_PROBE_BATCH", 30, maximum=500)
 # Serialize heavy maintenance so refresh + probe never stampede together.
 # Token refresh may wait this long for a probe cycle to finish.
 MAINTENANCE_LOCK_TIMEOUT = _env_float(
@@ -165,9 +186,9 @@ XAI_PROXY_PASSWORD = (
     or os.getenv("GROK2API_PROXY_PASSWORD")
     or ""
 ).strip()
-MOEMAIL_BASE_URL = os.getenv("GROK2API_MOEMAIL_BASE_URL", "https://moemail.521884.xyz")
+MOEMAIL_BASE_URL = os.getenv("GROK2API_MOEMAIL_BASE_URL", "https://moemail.example.com")
 MOEMAIL_API_KEY = os.getenv("GROK2API_MOEMAIL_API_KEY", "")
-MOEMAIL_DOMAIN = os.getenv("GROK2API_MOEMAIL_DOMAIN", "lolicc.online")
+MOEMAIL_DOMAIN = os.getenv("GROK2API_MOEMAIL_DOMAIN", "example.com")
 MOEMAIL_EXPIRY_MS = int(os.getenv("GROK2API_MOEMAIL_EXPIRY_MS", "3600000"))
 # Auto-refresh access tokens this many seconds before expiry
 TOKEN_REFRESH_SKEW = float(os.getenv("GROK2API_TOKEN_REFRESH_SKEW", "120"))
@@ -197,6 +218,61 @@ SSE_KEEPALIVE_INTERVAL = float(os.getenv("GROK2API_SSE_KEEPALIVE", "8"))
 # - think_tag: stream reasoning as content wrapped in <think>...</think>
 # - content: merge reasoning into content without tags
 REASONING_COMPAT = os.getenv("GROK2API_REASONING_COMPAT", "off").strip().lower()
+
+# ── Shared stores (high-concurrency mode: Redis + PostgreSQL required) ─────
+# hybrid is the only supported production mode. File JSON is migration-only.
+# Defaults point at compose profile `store` services on localhost.
+
+
+def _env_url(*names: str, default: str = "") -> str:
+    for n in names:
+        v = (os.getenv(n) or "").strip()
+        if v:
+            return v
+    return default
+
+
+DATABASE_URL = _env_url(
+    "GROK2API_DATABASE_URL",
+    "DATABASE_URL",
+    default="postgresql://grok2api:grok2api@127.0.0.1:5432/grok2api",
+)
+REDIS_URL = _env_url(
+    "GROK2API_REDIS_URL",
+    "REDIS_URL",
+    default="redis://127.0.0.1:6379/0",
+)
+
+_store_backend_raw = (os.getenv("GROK2API_STORE_BACKEND") or "hybrid").strip().lower()
+if _store_backend_raw == "file":
+    # Explicit escape hatch only — not recommended; multi-worker will refuse.
+    STORE_BACKEND = "file"
+else:
+    STORE_BACKEND = "hybrid"
+
+# Maintainer leader: only one process runs token_maintainer + model_health.
+# auto: elect via Redis (required in high-concurrency mode).
+# 1/true: always start maintainers in this process.
+# 0/false: never start maintainers here (another process owns them).
+MAINTAINER_LEADER = (os.getenv("GROK2API_MAINTAINER_LEADER") or "auto").strip().lower()
+
+# Redis key namespace prefix (all g2a:* keys).
+REDIS_KEY_PREFIX = (os.getenv("GROK2API_REDIS_PREFIX") or "g2a").strip() or "g2a"
+# Leader lock TTL / renew interval (seconds).
+MAINTAINER_LEADER_TTL = _env_float(
+    "GROK2API_MAINTAINER_LEADER_TTL", 30.0, minimum=5.0
+)
+MAINTAINER_LEADER_RENEW = _env_float(
+    "GROK2API_MAINTAINER_LEADER_RENEW", 10.0, minimum=2.0
+)
+
+# Fail closed unless both shared stores are configured (set 0 only for emergency).
+REQUIRE_SHARED_STORES = os.getenv("GROK2API_REQUIRE_SHARED_STORES", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
 
 # ── History compaction (Claude Code / long tool loops via sub2api) ──
 # Shrink past tool results before upstream so multi-round agent sessions

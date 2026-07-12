@@ -10,6 +10,9 @@ Fingerprint priority:
 
 Bindings are kept in memory and flushed to data/affinity.json so restarts
 do not drop sticky sessions within TTL.
+
+When REDIS_URL is set, bindings live in Redis (TTL keys) so multi-worker
+processes share sticky sessions.
 """
 
 from __future__ import annotations
@@ -34,7 +37,22 @@ _last_flush = 0.0
 AFFINITY_FILE = Path(os.getenv("GROK2API_AFFINITY_FILE", DATA_DIR / "affinity.json"))
 
 
+def _redis_mode() -> bool:
+    try:
+        from store.redis_client import redis_enabled
+
+        return redis_enabled()
+    except Exception:
+        return False
+
+
 def _enabled() -> bool:
+    try:
+        from settings_store import get_conversation_affinity_enabled
+
+        return bool(get_conversation_affinity_enabled())
+    except Exception:
+        pass
     return os.getenv("GROK2API_CONVERSATION_AFFINITY", "1").lower() not in (
         "0",
         "false",
@@ -246,6 +264,13 @@ def get_affinity(fingerprint: str | None) -> str | None:
     """Return bound account_id if still valid."""
     if not fingerprint or not _enabled():
         return None
+    if _redis_mode():
+        try:
+            from store import affinity_redis
+
+            return affinity_redis.get(fingerprint, ttl_sec=_ttl())
+        except Exception:
+            pass  # fall through to file map
     with _lock:
         _ensure_loaded()
         _purge_locked()
@@ -265,6 +290,14 @@ def bind_affinity(fingerprint: str | None, account_id: str | None) -> None:
     """Pin conversation fingerprint to account after successful use."""
     if not fingerprint or not account_id or not _enabled():
         return
+    if _redis_mode():
+        try:
+            from store import affinity_redis
+
+            affinity_redis.bind(fingerprint, account_id, ttl_sec=_ttl())
+            return
+        except Exception:
+            pass
     now = time.time()
     with _lock:
         _ensure_loaded()
@@ -287,6 +320,14 @@ def bind_affinity(fingerprint: str | None, account_id: str | None) -> None:
 def clear_affinity(fingerprint: str | None) -> None:
     if not fingerprint:
         return
+    if _redis_mode():
+        try:
+            from store import affinity_redis
+
+            affinity_redis.clear(fingerprint)
+            return
+        except Exception:
+            pass
     with _lock:
         _ensure_loaded()
         if fingerprint in _map:
@@ -302,6 +343,13 @@ def rebind_on_failover(
     """
     if not fingerprint or not new_account_id:
         return
+    if _redis_mode():
+        # In Redis mode, always rebind to the account that worked.
+        cur = get_affinity(fingerprint)
+        if cur and failed_account_id and cur != failed_account_id:
+            return
+        bind_affinity(fingerprint, new_account_id)
+        return
     with _lock:
         _ensure_loaded()
         entry = _map.get(fingerprint)
@@ -311,6 +359,28 @@ def rebind_on_failover(
 
 
 def status() -> dict[str, Any]:
+    if _redis_mode():
+        try:
+            from store import affinity_redis
+
+            sample = affinity_redis.status_sample()
+            return {
+                "enabled": _enabled(),
+                "ttl_sec": _ttl(),
+                "max_entries": _max_entries(),
+                "backend": "redis",
+                "active": sample.get("active", 0),
+                "persist_file": str(AFFINITY_FILE),
+                "sample": sample.get("sample") or [],
+            }
+        except Exception as e:  # noqa: BLE001
+            return {
+                "enabled": _enabled(),
+                "backend": "redis",
+                "error": str(e),
+                "active": 0,
+                "sample": [],
+            }
     with _lock:
         _ensure_loaded()
         _purge_locked()
@@ -318,6 +388,7 @@ def status() -> dict[str, Any]:
             "enabled": _enabled(),
             "ttl_sec": _ttl(),
             "max_entries": _max_entries(),
+            "backend": "file",
             "active": len(_map),
             "persist_file": str(AFFINITY_FILE),
             "sample": [

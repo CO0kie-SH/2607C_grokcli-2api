@@ -194,17 +194,34 @@ def _detect_billing_exhausted(
 
 
 def is_quota_error_message(error: str | None, status_code: int | None = None) -> bool:
-    """True if upstream error indicates hard quota/credit exhaustion."""
+    """True if upstream error indicates hard quota/credit exhaustion.
+
+    Rolling free-usage 429s (subscription:free-usage-exhausted) are temporary —
+    they must NOT permanently disable the account. Those are soft-blocked per
+    model by model_health instead so sub2api can keep scheduling.
+    """
     text = (error or "").strip()
     if not text:
+        return False
+    low = text.lower()
+    # Temporary free-tier windows / pure rate limits — never permanent disable.
+    if (
+        "free-usage-exhausted" in low
+        or "free usage" in low
+        or "usage resets over a rolling" in low
+        or status_code == 429
+    ):
         return False
     if _QUOTA_ERROR_RE.search(text):
         return True
     # 403 + spending/subscription style codes often mean no credits
     if status_code == 403 and any(
-        k in text.lower()
+        k in low
         for k in ("credit", "subscription", "billing", "spending", "limit", "quota")
     ):
+        # "need a grok subscription" / permanent block style only
+        if "free-usage" in low or "rate limit" in low:
+            return False
         return True
     return False
 
@@ -255,8 +272,19 @@ def apply_exhaustion_to_pool(
 
 
 def maybe_disable_from_quota_result(result: dict[str, Any]) -> dict[str, Any]:
-    """If quota result says exhausted, disable the account and annotate result."""
+    """If quota result says exhausted, disable the account and annotate result.
+
+    Always persist last_quota into DB/settings for admin UI cache.
+    """
     if not result.get("ok"):
+        # still cache failed query timestamp/error so UI can show "上次失败"
+        account_id = result.get("account_id")
+        if account_id:
+            try:
+                import account_pool
+                account_pool.save_quota_snapshot(account_id, result)
+            except Exception:
+                pass
         return result
     account_id = result.get("account_id")
     if result.get("exhausted"):
@@ -268,13 +296,18 @@ def maybe_disable_from_quota_result(result: dict[str, Any]) -> dict[str, Any]:
         result["disabled_record"] = disabled
         result["display"] = dict(result.get("display") or {})
         result["display"]["summary"] = f"额度耗尽 · 已移出轮询（{reason}）"
-    else:
-        result["auto_disabled"] = False
-        # Persist last known healthy quota snapshot on pool meta
+        # disable_for_quota already writes last_quota; keep explicit snapshot too
         if account_id:
             try:
                 import account_pool
-
+                account_pool.save_quota_snapshot(account_id, result)
+            except Exception:
+                pass
+    else:
+        result["auto_disabled"] = False
+        if account_id:
+            try:
+                import account_pool
                 account_pool.save_quota_snapshot(account_id, result)
             except Exception:
                 pass
@@ -514,4 +547,45 @@ async def fetch_all_quotas(
         "total_monthly_limit": total_limit,
         "total_remaining": total_remaining,
         "accounts": results,
+    }
+
+
+def list_cached_quotas(*, include_expired: bool = True) -> dict[str, Any]:
+    """Return last_quota snapshots from DB/settings without upstream calls."""
+    try:
+        import account_pool
+        rows = account_pool.list_pool_accounts()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e), "results": [], "count": 0}
+
+    results: list[dict[str, Any]] = []
+    for a in rows:
+        if not include_expired and a.get("expired"):
+            continue
+        q = a.get("last_quota")
+        if not isinstance(q, dict) or not q:
+            continue
+        item = dict(q)
+        item.setdefault("account_id", a.get("id"))
+        item.setdefault("email", a.get("email"))
+        item.setdefault("user_id", a.get("user_id"))
+        item.setdefault("ok", True if item.get("error") in (None, "") else False)
+        item["cached"] = True
+        item["pool_disabled"] = bool(a.get("disabled_for_quota") or a.get("enabled") is False)
+        # normalize display
+        if not item.get("display"):
+            summary = item.get("summary")
+            if summary:
+                item["display"] = {"summary": summary}
+        results.append(item)
+
+    exhausted = sum(1 for r in results if r.get("exhausted") or r.get("auto_disabled"))
+    ok_n = sum(1 for r in results if r.get("ok") and not r.get("exhausted"))
+    return {
+        "ok": True,
+        "cached": True,
+        "count": len(results),
+        "ok_count": ok_n,
+        "exhausted_count": exhausted,
+        "results": results,
     }

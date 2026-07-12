@@ -157,8 +157,30 @@ def _dump_json(data: dict[str, Any]) -> str:
     return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
 
+def _pg_accounts():
+    try:
+        from store.accounts_pg import enabled
+
+        if enabled():
+            from store import accounts_pg
+
+            return accounts_pg
+    except Exception:
+        return None
+    return None
+
+
 def read_auth_map(path: Path | None = None) -> dict[str, Any]:
     path = path or AUTH_FILE
+    # PostgreSQL durable backend (multi-worker / multi-host)
+    if path == AUTH_FILE or path.resolve() == AUTH_FILE.resolve():
+        pg = _pg_accounts()
+        if pg is not None:
+            try:
+                return pg.read_auth_map()
+            except Exception:
+                pass  # fall through to file
+
     # Fast path: cache hit without taking file lock (safe for read-mostly)
     cached = _cached_read(path)
     if cached is not None:
@@ -183,31 +205,50 @@ def read_auth_map(path: Path | None = None) -> dict[str, Any]:
         return dict(data)
 
 
+def _write_auth_file(data: dict[str, Any], path: Path) -> None:
+    """Atomic write of auth map to local file (backup/mirror/export source)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    payload = _dump_json(data if isinstance(data, dict) else {})
+    tmp.write_text(payload, encoding="utf-8")
+    last_err: Exception | None = None
+    for _ in range(8):
+        try:
+            os.replace(str(tmp), str(path))
+            last_err = None
+            break
+        except OSError as e:
+            last_err = e
+            time.sleep(0.03)
+    if last_err is not None:
+        try:
+            tmp.unlink(missing_ok=True)  # type: ignore[call-arg]
+        except TypeError:
+            if tmp.exists():
+                tmp.unlink()
+        raise last_err
+    _set_cache(path, data if isinstance(data, dict) else {}, _path_mtime_ns(path))
+
+
 def write_auth_map(data: dict[str, Any], path: Path | None = None) -> None:
+    """Persist auth map. PostgreSQL is primary when enabled; always mirror to file."""
     path = path or AUTH_FILE
+    data = data if isinstance(data, dict) else {}
+    if path == AUTH_FILE or path.resolve() == AUTH_FILE.resolve():
+        pg = _pg_accounts()
+        if pg is not None:
+            pg.write_auth_map(data)
+            _invalidate_cache(path)
+            # Keep local file mirror for export/tools; never let mirror failure
+            # roll back the durable PG write.
+            try:
+                with auth_lock():
+                    _write_auth_file(data, path)
+            except Exception:
+                pass
+            return
     with auth_lock():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
-        payload = _dump_json(data)
-        tmp.write_text(payload, encoding="utf-8")
-        # Windows: replace may fail if dest open; retry briefly
-        last_err: Exception | None = None
-        for _ in range(8):
-            try:
-                os.replace(str(tmp), str(path))
-                last_err = None
-                break
-            except OSError as e:
-                last_err = e
-                time.sleep(0.03)
-        if last_err is not None:
-            try:
-                tmp.unlink(missing_ok=True)  # type: ignore[call-arg]
-            except TypeError:
-                if tmp.exists():
-                    tmp.unlink()
-            raise last_err
-        _set_cache(path, data if isinstance(data, dict) else {}, _path_mtime_ns(path))
+        _write_auth_file(data, path)
 
 
 def mutate_auth_map(mutator) -> dict[str, Any]:
@@ -215,6 +256,17 @@ def mutate_auth_map(mutator) -> dict[str, Any]:
     Read → mutate(dict) → write under one lock.
     mutator receives the map and may modify in place; return value is ignored.
     """
+    pg = _pg_accounts()
+    if pg is not None:
+        data = pg.mutate_auth_map(mutator)
+        _invalidate_cache(AUTH_FILE)
+        # Mirror file after PG mutation so delete/refresh stays consistent.
+        try:
+            with auth_lock():
+                _write_auth_file(data if isinstance(data, dict) else {}, AUTH_FILE)
+        except Exception:
+            pass
+        return data
     with auth_lock():
         path = AUTH_FILE
         data: dict[str, Any] = {}
@@ -226,9 +278,55 @@ def mutate_auth_map(mutator) -> dict[str, Any]:
             except (OSError, json.JSONDecodeError):
                 data = {}
         mutator(data)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
-        tmp.write_text(_dump_json(data), encoding="utf-8")
-        os.replace(str(tmp), str(path))
-        _set_cache(path, data, _path_mtime_ns(path))
+        _write_auth_file(data, path)
         return data
+
+
+def upsert_auth_entry(
+    account_id: str,
+    entry: dict[str, Any],
+    *,
+    merge_same_user: bool = True,
+) -> str:
+    """Prefer row-level upsert on PG; fall back to full-map mutate on file."""
+    if not account_id or not isinstance(entry, dict):
+        return account_id or ""
+    pg = _pg_accounts()
+    if pg is not None:
+        try:
+            pg.upsert_account_merged(
+                account_id, entry, merge_same_user=merge_same_user
+            )
+            _invalidate_cache(AUTH_FILE)
+            # Keep file mirror in sync for export/tools after single-account upsert.
+            try:
+                mirrored = pg.read_auth_map()
+                with auth_lock():
+                    _write_auth_file(mirrored, AUTH_FILE)
+            except Exception:
+                pass
+            return account_id
+        except Exception:
+            pass
+
+    def _mut(data: dict[str, Any]) -> None:
+        uid = entry.get("user_id") or entry.get("principal_id")
+        token = entry.get("key")
+        if merge_same_user:
+            for k in list(data.keys()):
+                if k == account_id:
+                    continue
+                v = data.get(k)
+                if not isinstance(v, dict):
+                    continue
+                same_user = bool(
+                    uid
+                    and (v.get("user_id") == uid or v.get("principal_id") == uid)
+                )
+                same_token = bool(token and v.get("key") == token)
+                if same_user or same_token:
+                    del data[k]
+        data[account_id] = entry
+
+    mutate_auth_map(_mut)
+    return account_id

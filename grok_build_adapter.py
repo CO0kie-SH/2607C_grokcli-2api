@@ -28,7 +28,11 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 GBA = ROOT / "grok-build-auth"
-ADAPTER_BUILD = "2026-07-11-protocol-5"
+ADAPTER_BUILD = "2026-07-12-protocol-7"
+# Newly registered accounts often need a short settle window before probe.
+REGISTER_PROBE_DELAY_SEC = float(
+    os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "30") or 30
+)
 
 YESCAPTCHA_KEY = (
     os.environ.get("GROK2API_YESCAPTCHA_KEY")
@@ -55,21 +59,121 @@ def _now() -> float:
     return time.time()
 
 
+def _reg_redis() -> bool:
+    try:
+        from store.redis_client import redis_enabled
+
+        return redis_enabled()
+    except Exception:
+        return False
+
+
+def _mirror_reg_sess(sid: str, sess: dict[str, Any] | None) -> None:
+    if not _reg_redis() or not sid:
+        return
+    try:
+        from store import sessions_redis
+
+        if sess is None:
+            sessions_redis.reg_sess_delete(sid)
+        else:
+            sessions_redis.reg_sess_put(sid, sess)
+    except Exception:
+        pass
+
+
+def _mirror_reg_batch(batch_id: str, batch: dict[str, Any] | None) -> None:
+    if not _reg_redis() or not batch_id or batch is None:
+        return
+    try:
+        from store import sessions_redis
+
+        sessions_redis.reg_batch_put(batch_id, batch)
+    except Exception:
+        pass
+
+
+def _load_reg_sess(sid: str) -> dict[str, Any] | None:
+    with _lock:
+        local = _sessions.get(sid)
+        if local is not None:
+            return local
+    if not _reg_redis():
+        return None
+    try:
+        from store import sessions_redis
+
+        remote = sessions_redis.reg_sess_get(sid)
+        if remote:
+            with _lock:
+                _sessions.setdefault(sid, remote)
+            return remote
+    except Exception:
+        pass
+    return None
+
+
+def _load_reg_batch(batch_id: str) -> dict[str, Any] | None:
+    with _lock:
+        local = _batches.get(batch_id)
+        if local is not None:
+            return local
+    if not _reg_redis():
+        return None
+    try:
+        from store import sessions_redis
+
+        remote = sessions_redis.reg_batch_get(batch_id)
+        if remote:
+            with _lock:
+                _batches.setdefault(batch_id, remote)
+            return remote
+    except Exception:
+        pass
+    return None
+
+
 def _clean_old_sessions() -> None:
     cutoff = _now() - 6 * 3600
     for sid in list(_sessions.keys()):
         sess = _sessions.get(sid) or {}
         if float(sess.get("updated_at") or 0) < cutoff:
             _sessions.pop(sid, None)
+            _mirror_reg_sess(sid, None)
 
 
 def _compact_session(sess: dict[str, Any]) -> dict[str, Any]:
     out = dict(sess)
     out.pop("_client", None)
     out.pop("_oauth_client", None)
-    if out.get("auth_json"):
-        out["auth_json_count"] = len(out["auth_json"])
-        out.pop("auth_json", None)
+    out.pop("password", None)
+    out.pop("yescaptcha_key", None)
+    # Prefer explicit imported ids; fall back to auth_json summary for UI/logs.
+    imported_ids = list(out.get("imported_account_ids") or [])
+    imported_accounts = list(out.get("imported_accounts") or [])
+    aj = out.get("auth_json")
+    if isinstance(aj, dict):
+        rows = [x for x in (aj.get("imported") or []) if isinstance(x, dict)]
+        out["auth_json_count"] = len(rows)
+        if not imported_ids:
+            imported_ids = [str(x.get("id")) for x in rows if x.get("id")]
+        if not imported_accounts:
+            imported_accounts = [
+                {"id": x.get("id"), "email": x.get("email")}
+                for x in rows
+                if x.get("id") or x.get("email")
+            ]
+    elif aj is not None:
+        try:
+            out["auth_json_count"] = len(aj)  # type: ignore[arg-type]
+        except Exception:
+            out["auth_json_count"] = 0
+    if imported_ids:
+        out["imported_account_ids"] = imported_ids
+    if imported_accounts:
+        out["imported_accounts"] = imported_accounts
+    # Drop full auth payload from list/poll responses (secrets).
+    out.pop("auth_json", None)
     return out
 
 
@@ -338,6 +442,8 @@ def _start_one_registration(
         if batch_id and batch_id in _batches:
             _batches[batch_id]["session_ids"].append(sid)
             _batches[batch_id]["updated_at"] = _now()
+            _mirror_reg_batch(batch_id, dict(_batches[batch_id]))
+    _mirror_reg_sess(sid, sess)
 
     threading.Thread(
         target=_run_registration,
@@ -372,11 +478,24 @@ def start_registration(
 
     _clean_old_sessions()
 
-    key = (yescaptcha_key or YESCAPTCHA_KEY or "").strip()
+    # Prefer request override, then module attr, then live env (DB-applied at runtime).
+    key = (
+        yescaptcha_key
+        or YESCAPTCHA_KEY
+        or os.environ.get("GROK2API_YESCAPTCHA_KEY")
+        or os.environ.get("YESCAPTCHA_API_KEY")
+        or ""
+    ).strip()
+    if key and key != YESCAPTCHA_KEY:
+        # keep module attr in sync for subsequent workers
+        try:
+            globals()["YESCAPTCHA_KEY"] = key
+        except Exception:
+            pass
     if not key:
         return {
             "ok": False,
-            "error": "YESCAPTCHA_KEY is required (set GROK2API_YESCAPTCHA_KEY or pass yescaptcha_key)",
+            "error": "YESCAPTCHA_KEY is required (set GROK2API_YESCAPTCHA_KEY, save in 协议注册配置, or pass yescaptcha_key)",
         }
 
     try:
@@ -431,6 +550,7 @@ def start_registration(
     }
     with _lock:
         _batches[batch_id] = batch
+    _mirror_reg_batch(batch_id, batch)
 
     def _spawn_batch() -> None:
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -532,6 +652,7 @@ def _run_registration(
         sess["message"] = message
         sess["updated_at"] = _now()
         sess.update(kwargs)
+        _mirror_reg_sess(sid, sess)
 
     email = str(sess.get("email") or "").strip().lower()
     password = sess["password"]
@@ -948,21 +1069,121 @@ def _run_registration(
         )
         if not import_result.get("ok"):
             raise RuntimeError(
-                f"SSO json import failed: {import_result.get('error')}; "
+                f"SSO account import failed: {import_result.get('error')}; "
                 f"adapter_build={ADAPTER_BUILD}"
             )
+        # Registration import is durable PostgreSQL (accounts + account_pool).
+        # auth.json is only an optional mirror for export tools.
+        if import_result.get("storage") and import_result.get("storage") != "postgres":
+            print(
+                f"[grok-build-auth] WARN: import storage={import_result.get('storage')} "
+                f"(expected postgres). Check DATABASE_URL."
+            )
+        imported_rows = [
+            x for x in (import_result.get("imported") or []) if isinstance(x, dict)
+        ]
+        imported_ids = [str(x.get("id")) for x in imported_rows if x.get("id")]
+        imported_accounts = [
+            {"id": x.get("id"), "email": x.get("email") or email}
+            for x in imported_rows
+            if x.get("id") or x.get("email")
+        ]
         sess["auth_json"] = import_result
+        sess["imported_account_ids"] = imported_ids
+        sess["imported_accounts"] = imported_accounts
         sess["oauth"] = {
             "path": "sso_to_auth_json",
             "access_token": (token.get("access_token") or "")[:20] + "...",
             "refresh_token": bool(token.get("refresh_token")),
             "email": email,
         }
+        # Auto probe newly imported accounts so they are validated in the pool.
+        probe_summaries: list[dict[str, Any]] = []
+        if imported_ids:
+            delay = max(0.0, float(REGISTER_PROBE_DELAY_SEC or 0.0))
+            if delay > 0:
+                update(
+                    "probing",
+                    f"imported {len(imported_ids)} account(s); wait {int(delay)}s "
+                    f"before probe [{ADAPTER_BUILD}]",
+                    imported_account_ids=imported_ids,
+                    imported_accounts=imported_accounts,
+                    probe_delay_sec=delay,
+                )
+                time.sleep(delay)
+            update(
+                "probing",
+                f"imported {len(imported_ids)} account(s); probing pool health "
+                f"(delay={int(delay)}s) [{ADAPTER_BUILD}]",
+                imported_account_ids=imported_ids,
+                imported_accounts=imported_accounts,
+                probe_delay_sec=delay,
+            )
+            try:
+                import model_health
+
+                for aid in imported_ids:
+                    try:
+                        pr = model_health.probe_single_account(
+                            aid, None, auto_disable=True, source="register"
+                        )
+                        detail = pr.get("result") if isinstance(pr, dict) else None
+                        if not isinstance(detail, dict):
+                            detail = pr if isinstance(pr, dict) else {}
+                        err_text = (
+                            detail.get("error")
+                            or detail.get("message")
+                            or (pr.get("error") if isinstance(pr, dict) else None)
+                            or ""
+                        )
+                        latency = (
+                            detail.get("latency_ms")
+                            or detail.get("elapsed_ms")
+                            or detail.get("duration_ms")
+                        )
+                        probe_summaries.append(
+                            {
+                                "account_id": aid,
+                                "ok": bool(pr.get("ok") if isinstance(pr, dict) else False),
+                                "model": detail.get("model")
+                                or (pr.get("model") if isinstance(pr, dict) else None),
+                                "error": (str(err_text)[:180] if err_text else None),
+                                "latency_ms": latency,
+                            }
+                        )
+                    except Exception as pe:  # noqa: BLE001
+                        probe_summaries.append(
+                            {
+                                "account_id": aid,
+                                "ok": False,
+                                "error": str(pe)[:180],
+                            }
+                        )
+            except Exception as pe:  # noqa: BLE001
+                probe_summaries.append(
+                    {
+                        "account_id": None,
+                        "ok": False,
+                        "error": f"probe module error: {pe}"[:180],
+                    }
+                )
+        sess["probe"] = {
+            "count": len(probe_summaries),
+            "ok": sum(1 for p in probe_summaries if p.get("ok")),
+            "fail": sum(1 for p in probe_summaries if not p.get("ok")),
+            "results": probe_summaries,
+        }
+        ok_n = int(sess["probe"]["ok"])
+        fail_n = int(sess["probe"]["fail"])
         update(
             "imported",
             f"imported via sso_to_auth_json "
-            f"({len(import_result.get('imported') or [])} account(s)) "
+            f"({len(imported_ids) or len(imported_rows)} account(s)); "
+            f"probe ok={ok_n} fail={fail_n} "
             f"[{ADAPTER_BUILD}]",
+            imported_account_ids=imported_ids,
+            imported_accounts=imported_accounts,
+            probe=sess["probe"],
         )
         return
     except Exception as exc:  # noqa: BLE001
@@ -977,6 +1198,34 @@ def _run_registration(
 
 def list_registration_sessions() -> dict[str, Any]:
     _clean_old_sessions()
+    # Merge Redis-visible sessions/batches so other workers can observe progress.
+    if _reg_redis():
+        try:
+            from store import sessions_redis
+
+            for remote in sessions_redis.reg_sess_list():
+                sid = str(remote.get("id") or "")
+                if not sid:
+                    continue
+                with _lock:
+                    if sid not in _sessions:
+                        _sessions[sid] = remote
+                    else:
+                        # Prefer newer updated_at
+                        local = _sessions[sid]
+                        if float(remote.get("updated_at") or 0) > float(
+                            local.get("updated_at") or 0
+                        ):
+                            _sessions[sid] = {**local, **remote}
+            for remote_b in sessions_redis.reg_batch_list():
+                bid = str(remote_b.get("id") or remote_b.get("batch_id") or "")
+                if not bid:
+                    continue
+                with _lock:
+                    if bid not in _batches:
+                        _batches[bid] = remote_b
+        except Exception:
+            pass
     with _lock:
         sessions = [_compact_session(s) for s in _sessions.values()]
         batches = []
@@ -999,11 +1248,10 @@ def list_registration_sessions() -> dict[str, Any]:
 def get_registration_session(
     sid: str, *, include_auth_json: bool = False
 ) -> dict[str, Any] | None:
-    with _lock:
-        sess = _sessions.get(sid)
-        if not sess:
-            return None
-        out = dict(sess)
+    sess = _load_reg_sess(sid)
+    if not sess:
+        return None
+    out = dict(sess)
     out.pop("_client", None)
     out.pop("_oauth_client", None)
     out.pop("password", None)
@@ -1016,7 +1264,7 @@ def get_registration_session(
 def _batch_stats(session_ids: list[str]) -> dict[str, Any]:
     imported = error = running = 0
     for sid in session_ids:
-        sess = _sessions.get(sid) or {}
+        sess = _load_reg_sess(sid) or {}
         st = str(sess.get("status") or "")
         if st in ("imported", "success", "completed"):
             imported += 1
@@ -1042,15 +1290,17 @@ def _batch_stats(session_ids: list[str]) -> dict[str, Any]:
 
 
 def get_registration_batch(batch_id: str) -> dict[str, Any] | None:
-    with _lock:
-        b = _batches.get(batch_id)
-        if not b:
-            return None
-        sids = list(b.get("session_ids") or [])
-        stats = _batch_stats(sids)
-        sessions = [_compact_session(_sessions[s]) for s in sids if s in _sessions]
-        out = {**b, **stats, "sessions": sessions}
-    return out
+    b = _load_reg_batch(batch_id)
+    if not b:
+        return None
+    sids = list(b.get("session_ids") or [])
+    stats = _batch_stats(sids)
+    sessions = []
+    for s in sids:
+        sess = _load_reg_sess(s)
+        if sess:
+            sessions.append(_compact_session(sess))
+    return {**b, **stats, "sessions": sessions}
 
 
 # --------------------------------------------------------------------------- #

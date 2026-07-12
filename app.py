@@ -25,7 +25,7 @@ from typing import Any, AsyncIterator, Literal
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
 
@@ -50,7 +50,39 @@ import config as _config
 import history_compact
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.8.26"
+APP_VERSION = "1.9.19"
+
+# Shared upstream HTTP client (per process / worker) — reuse TLS + keepalive.
+_http_client: httpx.AsyncClient | None = None
+_http_client_lock = asyncio.Lock() if hasattr(asyncio, "Lock") else None  # set later
+
+
+async def get_http_client() -> httpx.AsyncClient:
+    """Process-wide AsyncClient with connection pooling for high concurrency."""
+    global _http_client
+    if _http_client is not None and not _http_client.is_closed:
+        return _http_client
+    # Double-checked init (asyncio single-threaded: assignment is enough)
+    if _http_client is None or _http_client.is_closed:
+        max_conn = int(os.getenv("GROK2API_HTTP_MAX_CONNECTIONS", "200") or 200)
+        max_keep = int(os.getenv("GROK2API_HTTP_MAX_KEEPALIVE", "50") or 50)
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(TIMEOUT, connect=30.0),
+            limits=httpx.Limits(
+                max_keepalive_connections=max_keep,
+                max_connections=max_conn,
+                keepalive_expiry=30.0,
+            ),
+            http2=False,
+        )
+    return _http_client
+
+
+async def _close_http_client() -> None:
+    global _http_client
+    if _http_client is not None and not _http_client.is_closed:
+        await _http_client.aclose()
+    _http_client = None
 
 
 def _on_startup() -> None:
@@ -59,7 +91,43 @@ def _on_startup() -> None:
     Large pools (hundreds of accounts) must not fan out network + rewrite
     multi-MB auth.json at process start — that freezes WSL. We only do a
     cheap normalize here; refresh/probe are staggered + concurrency-capped.
+
+    Multi-worker: only the elected maintainer leader starts token_maintainer
+    and model_health (see store.leader).
     """
+    # Fail-closed: multi-worker without Redis must not serve split-brain state.
+    try:
+        from store.redis_client import ensure_redis_or_raise
+
+        ensure_redis_or_raise()
+    except Exception as e:  # noqa: BLE001
+        print(f"  FATAL store: {e}")
+        raise
+
+    # Shared-store status (Redis / PG)
+    # Apply admin-persisted runtime settings (password-adjacent tunables live in
+    # settings store and must override env defaults after multi-worker boot).
+    try:
+        from settings_store import apply_runtime_settings_to_modules
+
+        apply_runtime_settings_to_modules()
+    except Exception as e:  # noqa: BLE001
+        print(f"  (runtime settings apply skipped: {e})")
+
+    try:
+        from store import store_status
+
+        st = store_status()
+        redis_s = st.get("redis") or {}
+        pg_s = st.get("postgres") or {}
+        print(
+            f"  store: backend={st.get('backend')} workers={st.get('workers')} "
+            f"redis={'ok' if redis_s.get('ok') else ('cfg' if redis_s.get('configured') else 'off')} "
+            f"pg={'ok' if pg_s.get('ok') else ('cfg' if pg_s.get('configured') else 'off')}"
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"  store: status unavailable ({e})")
+
     try:
         from oidc_auth import normalize_auth_file_keys
         from auth_store import read_auth_map
@@ -75,35 +143,79 @@ def _on_startup() -> None:
             print(f"  multi-account: {n_accounts} account(s) loaded")
     except Exception as e:  # noqa: BLE001
         print(f"  (auth normalize skipped: {e})")
+
+    start_maintainers = True
     try:
-        token_maintainer.start_background()
-        ts = token_maintainer.status()
+        from store.leader import should_start_maintainers, status as leader_status
+
+        start_maintainers = should_start_maintainers()
+        ls = leader_status()
         print(
-            "  token maintainer: enabled "
-            f"(startup_delay={ts.get('startup_delay_sec')}s "
-            f"workers={ts.get('refresh_workers')} "
-            f"batch={ts.get('refresh_batch')})"
+            f"  maintainer leader: is_leader={ls.get('is_leader')} "
+            f"mode={ls.get('mode')} id={ls.get('leader_id')}"
         )
     except Exception as e:  # noqa: BLE001
-        print(f"  (token maintainer failed: {e})")
-    try:
-        import model_health
+        print(f"  (leader election skipped: {e})")
+        start_maintainers = True
 
-        model_health.start_background()
-        mh = model_health.status()
-        if mh.get("enabled") and mh.get("running"):
+    if start_maintainers:
+        # One-shot cleanup: permanently invalid refresh tokens are dead weight —
+        # delete them from auth store + pool so only renew-able accounts remain.
+        try:
+            from oidc_auth import purge_refresh_invalid_accounts
+
+            purged = purge_refresh_invalid_accounts(dry_run=False)
+            if int(purged.get("deleted") or 0) > 0:
+                print(
+                    "  token maintainer: purged "
+                    f"{purged.get('deleted')} permanently invalid account(s)"
+                )
+        except Exception as e:  # noqa: BLE001
+            print(f"  (purge refresh_invalid skipped: {e})")
+        try:
+            import account_pool as _ap
+
+            rr = _ap.reenable_probe_kick_accounts()
+            if int(rr.get("reenabled") or 0) > 0:
+                print(
+                    "  model health: re-enabled "
+                    f"{rr.get('reenabled')} accounts previously hard-disabled by probe"
+                )
+        except Exception as e:  # noqa: BLE001
+            print(f"  (reenable probe_kick skipped: {e})")
+        try:
+            token_maintainer.start_background()
+            ts = token_maintainer.status()
             print(
-                "  model health: enabled "
-                f"(startup_delay={mh.get('startup_delay_sec')}s "
-                f"every {mh.get('interval_sec')}s "
-                f"workers={mh.get('probe_workers')} "
-                f"batch={mh.get('probe_batch')} "
-                f"models={mh.get('probe_models')})"
+                "  token maintainer: enabled "
+                f"(startup_delay={ts.get('startup_delay_sec')}s "
+                f"workers={ts.get('refresh_workers')} "
+                f"batch={ts.get('refresh_batch')})"
             )
-        else:
-            print("  model health: disabled or not started")
-    except Exception as e:  # noqa: BLE001
-        print(f"  (model health failed: {e})")
+        except Exception as e:  # noqa: BLE001
+            print(f"  (token maintainer failed: {e})")
+        try:
+            import model_health
+
+            model_health.start_background()
+            mh = model_health.status()
+            if mh.get("enabled") and mh.get("running"):
+                print(
+                    "  model health: enabled "
+                    f"(startup_delay={mh.get('startup_delay_sec')}s "
+                    f"every {mh.get('interval_sec')}s "
+                    f"workers={mh.get('probe_workers')} "
+                    f"batch={mh.get('probe_batch')} "
+                    f"models={mh.get('probe_models')})"
+                )
+            else:
+                print("  model health: disabled or not started")
+        except Exception as e:  # noqa: BLE001
+            print(f"  (model health failed: {e})")
+    else:
+        print("  token maintainer: skipped (not leader)")
+        print("  model health: skipped (not leader)")
+
     # Registration engine is optional — never block API startup.
     # Engine: dongguatanglinux/grok-build-auth (HTTP protocol) + MoeMail + sso_to_auth_json.
     try:
@@ -125,15 +237,19 @@ def _on_startup() -> None:
         print(f"  registration: unavailable ({e})")
 
 
+async def _on_shutdown() -> None:
+    await _close_http_client()
+
+
 app = FastAPI(
     title="grokcli-2api",
     description=(
         "OpenAI + Anthropic Messages API compatible gateway powered by Grok OIDC "
-        "session tokens. Standalone (no local Grok CLI); multi-account pool with "
-        "device-code login."
+        "session tokens. High-concurrency multi-worker with Redis + PostgreSQL."
     ),
     version=APP_VERSION,
     on_startup=[_on_startup],
+    on_shutdown=[_on_shutdown],
 )
 
 app.add_middleware(
@@ -192,26 +308,34 @@ class ChatCompletionRequest(BaseModel):
 # ── auth gate for local API ─────────────────────────────────────────────────
 
 
-def require_api_key(
+async def require_api_key(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="x-api-key"),
 ) -> apikeys.ApiKeyRecord | None:
-    """Validate client key when auth is required; return record or None."""
+    """Validate client key when auth is required; return record or None.
+
+    Runs verify_key off the event loop so Redis/PG/file IO never blocks SSE.
+    """
     token = None
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization[7:].strip()
     elif x_api_key:
         token = x_api_key.strip()
 
-    if not apikeys.auth_required():
-        # open mode: still accept & track valid keys if provided
+    required = await asyncio.to_thread(apikeys.auth_required)
+    if not required:
         if token:
-            rec = apikeys.verify_key(token)
-            return rec
+            return await asyncio.to_thread(apikeys.verify_key, token)
         return None
 
-    rec = apikeys.verify_key(token)
+    rec = await asyncio.to_thread(apikeys.verify_key, token)
     if rec is None:
+        try:
+            from store.metrics import inc
+
+            inc("g2a_auth_failures_total")
+        except Exception:
+            pass
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
     return rec
 
@@ -251,6 +375,83 @@ def _is_builtin_search_tool(tool: Any) -> bool:
     return ttype in _BUILTIN_SEARCH_TOOL_TYPES
 
 
+def _empty_tool_parameters() -> dict[str, Any]:
+    """Minimal JSON Schema object accepted by strict upstream deserializers."""
+    return {"type": "object", "properties": {}}
+
+
+def _ensure_tool_parameters(params: Any) -> dict[str, Any]:
+    """Coerce tool parameters / input_schema to a JSON-schema object.
+
+    Upstream rejects tools when `parameters` is missing, null, a non-object, or
+    an empty bare value — error looks like:
+      tools[0]: missing field `parameters`
+    Always return a dict with at least type=object.
+    """
+    if params is None:
+        return _empty_tool_parameters()
+    if isinstance(params, str):
+        text = params.strip()
+        if not text:
+            return _empty_tool_parameters()
+        try:
+            import json as _json
+
+            parsed = _json.loads(text)
+        except Exception:
+            return _empty_tool_parameters()
+        return _ensure_tool_parameters(parsed)
+    if not isinstance(params, dict):
+        return _empty_tool_parameters()
+    out = dict(params)
+    # Some clients send schema without top-level type.
+    if "type" not in out:
+        out["type"] = "object"
+    if out.get("type") == "object" and "properties" not in out:
+        out["properties"] = {}
+    return out
+
+
+def _normalize_function_tool(t: dict[str, Any]) -> dict[str, Any] | None:
+    """Normalize one function tool so function.parameters is always present."""
+    if isinstance(t.get("function"), dict):
+        fn = dict(t["function"])
+        name = fn.get("name") or t.get("name")
+        if not name:
+            return None
+        fn["name"] = name
+        raw_params = (
+            fn.get("parameters")
+            if fn.get("parameters") is not None
+            else fn.get("input_schema")
+            if fn.get("input_schema") is not None
+            else t.get("parameters")
+            if t.get("parameters") is not None
+            else t.get("input_schema")
+        )
+        fn["parameters"] = _ensure_tool_parameters(raw_params)
+        # Drop alternate schema key so upstream only sees `parameters`.
+        fn.pop("input_schema", None)
+        if t.get("description") is not None and fn.get("description") is None:
+            fn["description"] = t["description"]
+        return {"type": "function", "function": fn}
+
+    # Flat function shape: {type,name,description,parameters|input_schema}
+    name = t.get("name")
+    if not name:
+        return None
+    fn: dict[str, Any] = {"name": name}
+    if t.get("description") is not None:
+        fn["description"] = t["description"]
+    raw_params = (
+        t.get("parameters")
+        if t.get("parameters") is not None
+        else t.get("input_schema")
+    )
+    fn["parameters"] = _ensure_tool_parameters(raw_params)
+    return {"type": "function", "function": fn}
+
+
 def _normalize_tools(tools: list[Any] | None) -> list[Any] | None:
     """
     Accept OpenAI Chat Completions tool shape and built-in tool types.
@@ -259,6 +460,8 @@ def _normalize_tools(tools: list[Any] | None) -> list[Any] | None:
       {"type":"function","function":{"name":...,"description":...,"parameters":...}}
     Flat function (some SDKs):
       {"type":"function","name":...,"description":...,"parameters":...}
+    Anthropic-ish:
+      {"name":...,"description":...,"input_schema":...}
 
     Built-in web/live search tools from new-api playground / OpenAI Responses:
       {"type":"web_search" | "web_search_preview" | "live_search" | "x_search", ...}
@@ -267,47 +470,32 @@ def _normalize_tools(tools: list[Any] | None) -> list[Any] | None:
       - tools[].type only allows `function` | `live_search`
       - bare `live_search` → 422 missing field `sources`
       - `live_search` + sources → 410 deprecated (Agent Tools API)
+      - function tools MUST include function.parameters
 
     Therefore built-in search tools are **stripped** on this chat path so
-    new-api / relays do not surface Upstream 422. Client function tools pass.
+    new-api / relays do not surface Upstream 422. Client function tools pass
+    with parameters always filled.
     """
     if not tools:
         return tools
     out: list[Any] = []
     for t in tools:
         if not isinstance(t, dict):
-            out.append(t)
             continue
         ttype = (t.get("type") or "function").lower()
         # Drop built-in search tools — do not map to broken/deprecated live_search.
         if ttype in _BUILTIN_SEARCH_TOOL_TYPES:
             continue
+        # Anthropic tools often omit type and only have name + input_schema.
         if ttype != "function":
             # Unknown non-function types are unsafe for this upstream; drop them
             # rather than forwarding a shape that 422s the whole request.
-            continue
-        if isinstance(t.get("function"), dict):
-            fn = t["function"]
-            # Ensure parameters is present for upstream deserialization
-            fn_out = dict(fn)
-            if "parameters" not in fn_out:
-                fn_out["parameters"] = {"type": "object", "properties": {}}
-            out.append({"type": "function", "function": fn_out})
-            continue
-        # flatten → nest
-        name = t.get("name")
-        if not name:
-            # no name and not a recognized function — drop
-            continue
-        fn: dict[str, Any] = {"name": name}
-        if t.get("description") is not None:
-            fn["description"] = t["description"]
-        params = t.get("parameters") if t.get("parameters") is not None else t.get("input_schema")
-        if params is not None:
-            fn["parameters"] = params
-        else:
-            fn["parameters"] = {"type": "object", "properties": {}}
-        out.append({"type": "function", "function": fn})
+            # Exception: bare name+schema without type already defaulted to function.
+            if t.get("type") is not None:
+                continue
+        norm = _normalize_function_tool(t)
+        if norm is not None:
+            out.append(norm)
     return out or None
 
 
@@ -474,19 +662,43 @@ def _sanitize_upstream_body(body: dict[str, Any], *, model: str | None = None) -
     # new-api playground may inject non-OpenAI fields (e.g. group) via extra="allow".
     body.pop("group", None)
 
-    # Final tools scrub: chat/completions only allows function tools now.
+    # Final tools scrub: chat/completions only allows function tools, and each
+    # function tool must include `parameters` (upstream 422 otherwise).
     tools = body.get("tools")
     if isinstance(tools, list):
-        cleaned = [
-            t
-            for t in tools
-            if isinstance(t, dict)
-            and (t.get("type") or "function").lower() == "function"
-        ]
+        cleaned: list[Any] = []
+        for t in tools:
+            if not isinstance(t, dict):
+                continue
+            if (t.get("type") or "function").lower() != "function":
+                continue
+            norm = _normalize_function_tool(t)
+            if norm is not None:
+                cleaned.append(norm)
         if cleaned:
             body["tools"] = cleaned
         else:
             body.pop("tools", None)
+    # Legacy OpenAI `functions` array also needs parameters if present.
+    funcs = body.get("functions")
+    if isinstance(funcs, list):
+        fixed_fns: list[Any] = []
+        for f in funcs:
+            if not isinstance(f, dict) or not f.get("name"):
+                continue
+            fn = dict(f)
+            raw = (
+                fn.get("parameters")
+                if fn.get("parameters") is not None
+                else fn.get("input_schema")
+            )
+            fn["parameters"] = _ensure_tool_parameters(raw)
+            fn.pop("input_schema", None)
+            fixed_fns.append(fn)
+        if fixed_fns:
+            body["functions"] = fixed_fns
+        else:
+            body.pop("functions", None)
     tc = body.get("tool_choice")
     if isinstance(tc, dict):
         tc_type = (tc.get("type") or "function").lower()
@@ -721,18 +933,87 @@ async def _aiter_sse_lines_with_keepalive(
 
 
 def openai_error(
-    message: str, status: int = 500, err_type: str = "server_error"
+    message: str,
+    status: int = 500,
+    err_type: str = "server_error",
+    *,
+    retry_after: float | int | None = None,
+    code: str | int | None = None,
 ) -> JSONResponse:
+    headers = {}
+    if retry_after is not None:
+        try:
+            headers["Retry-After"] = str(max(1, int(float(retry_after))))
+        except (TypeError, ValueError):
+            headers["Retry-After"] = "5"
     return JSONResponse(
         status_code=status,
         content={
             "error": {
                 "message": message,
                 "type": err_type,
-                "code": status,
+                "code": code if code is not None else status,
             }
         },
+        headers=headers or None,
     )
+
+
+def _client_pool_error(exc: Exception | str, *, default_status: int = 503) -> JSONResponse:
+    """Map pool/auth selection failures to a client-friendly temporary error.
+
+    Light agent/API callers should see 503 + Retry-After (retryable), not 401
+    authentication_error which makes sub2api/Claude Code stop scheduling.
+    """
+    msg = str(exc or "No eligible accounts")
+    low = msg.lower()
+    retry_after = 5
+    if "no live accounts" in low or "auth store" in low:
+        status, err_type, code = 503, "service_unavailable", "no_accounts"
+        retry_after = 15
+    elif "no eligible" in low or "blocked for model" in low or "cooldown" in low:
+        status, err_type, code = 503, "service_unavailable", "pool_exhausted"
+        retry_after = 8
+    elif "expired" in low:
+        status, err_type, code = 503, "service_unavailable", "accounts_expired"
+        retry_after = 20
+    else:
+        status, err_type, code = default_status, "service_unavailable", "pool_unavailable"
+    # Keep message short & actionable for relays
+    friendly = (
+        "账号池暂不可用，正在恢复中，请稍后重试。"
+        if status == 503
+        else msg
+    )
+    if "model" in low:
+        friendly = "当前模型账号暂时繁忙或额度滚动耗尽，请稍后重试。"
+    return openai_error(
+        friendly + f" ({msg[:160]})" if msg and msg not in friendly else friendly,
+        status=status,
+        err_type=err_type,
+        retry_after=retry_after,
+        code=code,
+    )
+
+
+def _sanitize_upstream_error_message(detail: str, status_code: int | None = None) -> str:
+    """Short, non-leaky upstream error for clients (full detail stays in logs/pool)."""
+    text = (detail or "").strip()
+    low = text.lower()
+    if "free-usage-exhausted" in low or "free usage" in low:
+        return "上游临时额度耗尽，已自动切换账号"
+    if status_code == 429 or "rate limit" in low or "too many requests" in low:
+        return "上游限流，已自动切换账号"
+    if status_code == 401:
+        return "上游鉴权失败，已自动切换账号"
+    if status_code in (502, 503, 504):
+        return "上游暂时不可用，已自动切换账号"
+    if status_code == 404 and "model" in low:
+        return "上游模型不可用"
+    # Collapse JSON blobs
+    if text.startswith("{") and len(text) > 180:
+        return f"上游错误 HTTP {status_code or '?'}"
+    return (text[:220] + "…") if len(text) > 220 else (text or f"上游错误 HTTP {status_code or '?'}")
 
 
 def _sse_chunk(
@@ -931,6 +1212,35 @@ def _iter_tool_sse_chunks(
             )
         )
     return frames
+
+
+async def _yield_anthropic_events_serial(
+    events: list[str],
+    *,
+    client_gone: bool = False,
+) -> AsyncIterator[str]:
+    """Yield Anthropic SSE events, inserting a real gap before the next tool_use.
+
+    sub2api keeps one content_block active. When multiple tool_use start/stop
+    pairs land in one TCP window, Claude Code hits "Content block not found"
+    and stops scheduling further agent turns. Sleep only when the next event
+    opens another tool_use (not on text/thinking stops).
+    """
+    if not events:
+        return
+    gap = float(getattr(history_compact, "OUTBOUND_TOOL_GAP_SEC", 0.0) or 0.0)
+    n = len(events)
+    for i, ev in enumerate(events):
+        if client_gone:
+            return
+        if (
+            gap > 0
+            and i > 0
+            and '"type": "content_block_start"' in ev
+            and "tool_use" in ev
+        ):
+            await asyncio.sleep(gap)
+        yield ev
 
 
 async def _emit_tool_sse_serial(
@@ -1189,7 +1499,7 @@ def _flush_tool_call_argument_deltas(
 
     Prefer _flush_one_tool_call + loop on the SSE path so sub2api never sees a
     multi-tool burst without per-tool framing. This helper remains for bulk
-    collection; OUTBOUND_MAX_TOOLS (default 1) can still cap the returned list
+    collection; OUTBOUND_MAX_TOOLS (default 1 for sub2api) can still cap the returned list
     without marking unreturned siblings as emitted.
     """
     out: list[dict[str, Any]] = []
@@ -1390,12 +1700,29 @@ async def health():
         reg = _reg.registration_available()
     except Exception as e:  # noqa: BLE001
         reg = {"available": False, "error": str(e)}
+    store_info: dict[str, Any] = {}
+    leader_info: dict[str, Any] = {}
+    try:
+        from store import store_status
+
+        store_info = store_status()
+    except Exception as e:  # noqa: BLE001
+        store_info = {"error": str(e)}
+    try:
+        from store.leader import status as leader_status
+
+        leader_info = leader_status()
+    except Exception as e:  # noqa: BLE001
+        leader_info = {"error": str(e)}
     try:
         # Counts only; omit the hundreds-of-accounts payload.
-        pool = account_pool.pool_summary(include_accounts=False)
+        # Offload sync store IO so health never blocks the event loop.
+        pool = await asyncio.to_thread(
+            account_pool.pool_summary, include_accounts=False
+        )
         # Health must stay a bounded read-only route. Do not make an OIDC
         # refresh request while resolving the representative account.
-        creds = account_pool.acquire(auto_refresh=False)
+        creds = await asyncio.to_thread(account_pool.acquire, auto_refresh=False)
         return {
             "status": "ok",
             "version": APP_VERSION,
@@ -1414,6 +1741,8 @@ async def health():
             "model_health": __import__("model_health").status(light=True),
             "conversation_affinity": conversation_affinity.status(),
             "registration": reg,
+            "store": store_info,
+            "maintainer_leader": leader_info,
         }
     except AuthError as e:
         return JSONResponse(
@@ -1423,22 +1752,73 @@ async def health():
                 "message": str(e),
                 "version": APP_VERSION,
                 "registration": reg,
+                "store": store_info,
+                "maintainer_leader": leader_info,
             },
         )
 
 
-def _admin_html_response():
-    admin_index = STATIC_DIR / "index.html"
-    if not admin_index.is_file():
+@app.get("/metrics")
+async def metrics():
+    """Prometheus text exposition (in-process counters + store gauges)."""
+    from fastapi.responses import PlainTextResponse
+
+    try:
+        from store.metrics import prometheus_text
+
+        body = prometheus_text()
+    except Exception as e:  # noqa: BLE001
+        body = f"# error {e}\n"
+    return PlainTextResponse(body, media_type="text/plain; version=0.0.4")
+
+
+def _admin_page(name: str = "index"):
+    """Serve multi-page admin HTML from static/admin/{name}.html."""
+    # allow only known pages
+    allowed = {
+        "index": "index.html",
+        "overview": "index.html",
+        "login": "login.html",
+        "keys": "keys.html",
+        "accounts": "accounts.html",
+        "models": "models.html",
+        "guide": "guide.html",
+        "settings": "settings.html",
+        "logs": "logs.html",
+    }
+    filename = allowed.get((name or "index").strip().lower())
+    if not filename:
         return None
+    admin_file = STATIC_DIR / "admin" / filename
+    if not admin_file.is_file():
+        # fallback to legacy single-file console
+        legacy = STATIC_DIR / "index.html"
+        if legacy.is_file() and name in ("index", "overview", "login"):
+            admin_file = legacy
+        else:
+            return None
     return FileResponse(
-        admin_index,
+        admin_file,
         media_type="text/html; charset=utf-8",
         headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
             "Pragma": "no-cache",
+            "Expires": "0",
         },
     )
+
+
+def _admin_html_response():
+    """Backward-compatible alias → overview page."""
+    return _admin_page("index")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    icon = STATIC_DIR / "favicon.ico"
+    if icon.is_file() and icon.stat().st_size > 0:
+        return FileResponse(icon, media_type="image/x-icon")
+    return JSONResponse({"detail": "not found"}, status_code=404)
 
 
 @app.get("/")
@@ -1468,18 +1848,64 @@ async def root():
     }
 
 
-@app.get("/admin")
-@app.get("/admin/")
-@app.get("/admin/login")
-@app.get("/admin/login/")
-async def admin_page():
-    html = _admin_html_response()
+def _admin_or_404(name: str):
+    html = _admin_page(name)
     if html is None:
         return JSONResponse(
             status_code=404,
-            content={"error": "Admin UI not found. Missing static/index.html"},
+            content={
+                "error": f"Admin UI page not found: {name}. Missing static/admin/*.html"
+            },
         )
     return html
+
+
+@app.get("/admin")
+@app.get("/admin/")
+async def admin_overview_page():
+    return _admin_or_404("index")
+
+
+@app.get("/admin/login")
+@app.get("/admin/login/")
+async def admin_login_page():
+    return _admin_or_404("login")
+
+
+@app.get("/admin/keys")
+@app.get("/admin/keys/")
+async def admin_keys_page():
+    return _admin_or_404("keys")
+
+
+@app.get("/admin/accounts")
+@app.get("/admin/accounts/")
+async def admin_accounts_page():
+    return _admin_or_404("accounts")
+
+
+@app.get("/admin/logs")
+@app.get("/admin/logs/")
+async def admin_logs_page():
+    return _admin_or_404("logs")
+
+
+@app.get("/admin/models")
+@app.get("/admin/models/")
+async def admin_models_page():
+    return _admin_or_404("models")
+
+
+@app.get("/admin/guide")
+@app.get("/admin/guide/")
+async def admin_guide_page():
+    return _admin_or_404("guide")
+
+
+@app.get("/admin/settings")
+@app.get("/admin/settings/")
+async def admin_settings_page():
+    return _admin_or_404("settings")
 
 
 @app.get("/v1/models", dependencies=[Depends(require_api_key)])
@@ -1520,17 +1946,40 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             "messages is required", status=400, err_type="invalid_request_error"
         )
 
-    conv_fp, prefer_account = _resolve_conversation_affinity(req, request)
+    conv_fp, prefer_account = await asyncio.to_thread(
+        _resolve_conversation_affinity, req, request
+    )
     model = resolve_model(req.model)
 
     try:
-        chain = account_pool.try_acquire_sequence(
-            model=model, prefer_account_id=prefer_account
-        )
-        if not chain:
-            chain = [account_pool.acquire(model=model)]
+        def _pick_chain():
+            chain = account_pool.try_acquire_sequence(
+                model=model, prefer_account_id=prefer_account
+            )
+            if not chain:
+                chain = [account_pool.acquire(model=model)]
+            return chain
+
+        chain = await asyncio.to_thread(_pick_chain)
     except AuthError as e:
-        return openai_error(str(e), status=401, err_type="authentication_error")
+        try:
+            from store.metrics import inc
+
+            inc("g2a_auth_failures_total")
+        except Exception:
+            pass
+        return _client_pool_error(e)
+
+    try:
+        from store.metrics import inc
+
+        inc("g2a_requests_total")
+        if prefer_account:
+            inc("g2a_affinity_hits_total")
+        elif conv_fp:
+            inc("g2a_affinity_misses_total")
+    except Exception:
+        pass
 
     body = build_upstream_body(req, model)
     url = f"{UPSTREAM_BASE}/chat/completions"
@@ -1577,16 +2026,27 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             content, reasoning, finish, usage, tool_calls = await _collect_completion(
                 url=url, headers=headers, body=body
             )
-            account_pool.report_success(creds.auth_key)
+            await asyncio.to_thread(account_pool.report_success, creds.auth_key, model=model)
             used = creds
             # Keep multi-turn memory on this account; rebind if failover
             if conv_fp:
                 if prefer_account and prefer_account != creds.auth_key:
-                    conversation_affinity.rebind_on_failover(
-                        conv_fp, first_tried, creds.auth_key
+                    await asyncio.to_thread(
+                        conversation_affinity.rebind_on_failover,
+                        conv_fp,
+                        first_tried,
+                        creds.auth_key,
                     )
+                    try:
+                        from store.metrics import inc
+
+                        inc("g2a_account_failovers_total")
+                    except Exception:
+                        pass
                 else:
-                    conversation_affinity.bind_affinity(conv_fp, creds.auth_key)
+                    await asyncio.to_thread(
+                        conversation_affinity.bind_affinity, conv_fp, creds.auth_key
+                    )
             message: dict[str, Any] = {
                 "role": "assistant",
                 "content": content if content else (None if tool_calls else ""),
@@ -1629,26 +2089,62 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         except httpx.HTTPStatusError as e:
             code = e.response.status_code if e.response is not None else 502
             detail = e.response.text[:800] if e.response is not None else str(e)
-            account_pool.report_failure(
-                creds.auth_key, error=detail, status_code=code, model=model
+            hdrs = dict(e.response.headers) if e.response is not None else None
+            await asyncio.to_thread(
+                account_pool.report_failure,
+                creds.auth_key,
+                error=detail,
+                status_code=code,
+                model=model,
+                headers=hdrs,
             )
+            try:
+                from store.metrics import inc
+
+                inc("g2a_upstream_failures_total")
+            except Exception:
+                pass
             last_error = f"Upstream {code}: {detail}"
             last_status = code
             if not _retryable_status(code):
                 break
             continue
         except Exception as e:  # noqa: BLE001
-            account_pool.report_failure(
-                creds.auth_key, error=str(e), status_code=502, model=model
+            await asyncio.to_thread(
+                account_pool.report_failure,
+                creds.auth_key,
+                error=str(e),
+                status_code=502,
+                model=model,
             )
+            try:
+                from store.metrics import inc
+
+                inc("g2a_upstream_failures_total")
+            except Exception:
+                pass
             last_error = f"Proxy error: {e}"
             last_status = 502
             continue
 
+    # All accounts in chain failed — tell clients this is temporary/retryable when
+    # the last status was a known transient upstream code.
+    final_status = last_status if last_status < 600 else 502
+    retryable = final_status in (401, 403, 429, 500, 502, 503, 504)
+    friendly = _sanitize_upstream_error_message(last_error or "", final_status)
+    if retryable:
+        return openai_error(
+            friendly or "所有账号暂时失败，请稍后重试",
+            status=503,
+            err_type="upstream_error",
+            retry_after=8,
+            code="all_accounts_failed",
+        )
     return openai_error(
-        last_error or "All accounts failed",
-        status=last_status if last_status < 600 else 502,
+        friendly or last_error or "All accounts failed",
+        status=final_status,
         err_type="upstream_error",
+        code=final_status,
     )
 
 
@@ -1719,369 +2215,398 @@ async def _stream_proxy_with_failover(
         held_pre_tool: list[tuple[str | None, str | None]] = []
         try:
             upstream_body = _body_for_upstream(body)
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(TIMEOUT, connect=30.0),
-                limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
-            ) as client:
-                async with client.stream(
-                    "POST", url, headers=headers, json=upstream_body
-                ) as resp:
-                    if resp.status_code >= 400:
-                        err_text = (await resp.aread()).decode(
-                            "utf-8", errors="replace"
-                        )[:1500]
-                        account_pool.report_failure(
+            client = await get_http_client()
+            async with client.stream(
+                "POST", url, headers=headers, json=upstream_body
+            ) as resp:
+                if resp.status_code >= 400:
+                    err_text = (await resp.aread()).decode(
+                        "utf-8", errors="replace"
+                    )[:1500]
+                    await asyncio.to_thread(
+                        account_pool.report_failure,
+                        creds.auth_key,
+                        error=err_text,
+                        status_code=resp.status_code,
+                        model=model,
+                        headers=dict(resp.headers),
+                    )
+                    last_err = f"Upstream {resp.status_code}: {err_text}"
+                    # try next account if retryable and more remain
+                    if _retryable_status(resp.status_code) and idx < len(chain) - 1:
+                        continue
+                    err_payload = {
+                        "id": chat_id,
+                        "object": "error",
+                        "error": {
+                            "message": last_err,
+                            "type": "upstream_error",
+                            "code": resp.status_code,
+                        },
+                    }
+                    yield f"data: {json.dumps(err_payload, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+                await asyncio.to_thread(account_pool.report_success, creds.auth_key, model=model)
+                if conversation_fp:
+                    if idx > 0:
+                        await asyncio.to_thread(
+                            conversation_affinity.rebind_on_failover,
+                            conversation_fp,
+                            first_tried,
                             creds.auth_key,
-                            error=err_text,
-                            status_code=resp.status_code,
-                            model=model,
                         )
-                        last_err = f"Upstream {resp.status_code}: {err_text}"
-                        # try next account if retryable and more remain
-                        if _retryable_status(resp.status_code) and idx < len(chain) - 1:
-                            continue
-                        err_payload = {
-                            "id": chat_id,
-                            "object": "error",
-                            "error": {
-                                "message": last_err,
-                                "type": "upstream_error",
-                                "code": resp.status_code,
-                            },
-                        }
-                        yield f"data: {json.dumps(err_payload, ensure_ascii=False)}\n\n"
-                        yield "data: [DONE]\n\n"
-                        return
-
-                    account_pool.report_success(creds.auth_key)
-                    if conversation_fp:
-                        if idx > 0:
-                            conversation_affinity.rebind_on_failover(
-                                conversation_fp, first_tried, creds.auth_key
-                            )
-                        else:
-                            conversation_affinity.bind_affinity(
-                                conversation_fp, creds.auth_key
-                            )
-
-                    if not role_sent:
-                        # Role-only delta (no empty content) — required for new-api playground.
-                        yield _sse_chunk(
-                            chat_id=chat_id,
-                            model=model,
-                            created=created,
-                            role="assistant",
+                    else:
+                        await asyncio.to_thread(
+                            conversation_affinity.bind_affinity,
+                            conversation_fp,
+                            creds.auth_key,
                         )
-                        role_sent = True
 
-                    ctype = (resp.headers.get("content-type") or "").lower()
-                    if "text/event-stream" in ctype or "stream" in ctype:
-                        async for line in _aiter_sse_lines_with_keepalive(resp):
-                            # Soft disconnect check: keep draining so we can still
-                            # emit a terminal finish/tool_calls frame when possible.
-                            try:
-                                if await client_disconnected():
-                                    client_gone = True
-                            except Exception:
+                if not role_sent:
+                    # Role-only delta (no empty content) — required for new-api playground.
+                    yield _sse_chunk(
+                        chat_id=chat_id,
+                        model=model,
+                        created=created,
+                        role="assistant",
+                    )
+                    role_sent = True
+
+                ctype = (resp.headers.get("content-type") or "").lower()
+                if "text/event-stream" in ctype or "stream" in ctype:
+                    async for line in _aiter_sse_lines_with_keepalive(resp):
+                        # Soft disconnect check: keep draining so we can still
+                        # emit a terminal finish/tool_calls frame when possible.
+                        try:
+                            if await client_disconnected():
                                 client_gone = True
-                            if line is None:
-                                # idle keepalive for newapi / reverse proxies
-                                if not client_gone:
-                                    yield _sse_keepalive()
-                                continue
-                            parsed = _parse_sse_line(line)
-                            if parsed is None:
-                                continue
-                            if parsed == "[DONE]":
-                                break
-                            assert isinstance(parsed, dict)
-                            if isinstance(parsed.get("usage"), dict):
-                                usage = parsed["usage"]
-                            content, reasoning, tool_calls = _extract_delta_parts(
-                                parsed
+                        except Exception:
+                            client_gone = True
+                        if line is None:
+                            # idle keepalive for newapi / reverse proxies
+                            if not client_gone:
+                                yield _sse_keepalive()
+                            continue
+                        parsed = _parse_sse_line(line)
+                        if parsed is None:
+                            continue
+                        if parsed == "[DONE]":
+                            break
+                        assert isinstance(parsed, dict)
+                        if isinstance(parsed.get("usage"), dict):
+                            usage = parsed["usage"]
+                        content, reasoning, tool_calls = _extract_delta_parts(
+                            parsed
+                        )
+                        finish = None
+                        choices = parsed.get("choices")
+                        if isinstance(choices, list) and choices:
+                            finish = choices[0].get("finish_reason")
+                        # usage-only final chunk (choices empty / null)
+                        if (
+                            not content
+                            and not reasoning
+                            and not tool_calls
+                            and not finish
+                            and isinstance(parsed.get("usage"), dict)
+                        ):
+                            usage = parsed["usage"]
+                            continue
+                        if content:
+                            content_parts.append(content)
+                        if reasoning:
+                            reasoning_parts.append(reasoning)
+                        emit_tool_calls: list[Any] | None = None
+                        if tool_calls:
+                            tools_pending = True
+                            # Upstream produced tools even if request tools[]
+                            # was stripped — force tools-mode hold/suppress.
+                            tools_requested = True
+                            # At most ONE complete tool per upstream SSE line.
+                            # Burst-draining every ready tool still races
+                            # sub2api's single active content_block (esp. Read).
+                            # Remaining tools emit on later ticks / terminal
+                            # flush, still one frame at a time.
+                            budget = history_compact.remaining_outbound_tool_budget(
+                                tools_emitted_count
                             )
-                            finish = None
-                            choices = parsed.get("choices")
-                            if isinstance(choices, list) and choices:
-                                finish = choices[0].get("finish_reason")
-                            # usage-only final chunk (choices empty / null)
-                            if (
-                                not content
-                                and not reasoning
-                                and not tool_calls
-                                and not finish
-                                and isinstance(parsed.get("usage"), dict)
-                            ):
-                                usage = parsed["usage"]
-                                continue
-                            if content:
-                                content_parts.append(content)
-                            if reasoning:
-                                reasoning_parts.append(reasoning)
-                            emit_tool_calls: list[Any] | None = None
-                            if tool_calls:
-                                tools_pending = True
-                                # Upstream produced tools even if request tools[]
-                                # was stripped — force tools-mode hold/suppress.
-                                tools_requested = True
-                                # At most ONE complete tool per upstream SSE line.
-                                # Burst-draining every ready tool still races
-                                # sub2api's single active content_block (esp. Read).
-                                # Remaining tools emit on later ticks / terminal
-                                # flush, still one frame at a time.
-                                budget = history_compact.remaining_outbound_tool_budget(
-                                    tools_emitted_count
+                            if budget is not None and budget <= 0:
+                                # Cap reached: still ingest for accounting, no emit.
+                                _ingest_tool_call_deltas(tool_acc, tool_calls)
+                                emit_tool_calls = None
+                            else:
+                                emit_tool_calls = (
+                                    _tool_call_argument_delta(tool_acc, tool_calls)
+                                    or None
                                 )
-                                if budget is not None and budget <= 0:
-                                    # Cap reached: still ingest for accounting, no emit.
-                                    _ingest_tool_call_deltas(tool_acc, tool_calls)
-                                    emit_tool_calls = None
-                                else:
-                                    emit_tool_calls = (
-                                        _tool_call_argument_delta(tool_acc, tool_calls)
-                                        or None
-                                    )
-                                    if (
-                                        emit_tool_calls
-                                        and budget is not None
-                                        and len(emit_tool_calls) > budget
-                                    ):
-                                        emit_tool_calls = emit_tool_calls[:budget]
-                                # Only when a tool frame is actually outbound do
-                                # tools "win" the turn. Incomplete name-only /
-                                # partial-arg previews must keep holding preface.
-                                if emit_tool_calls:
-                                    saw_tool_calls = True
-                                    if tools_requested and held_pre_tool:
-                                        held_pre_tool.clear()
-                                        reasoning_compat.think_open = False
-
-                            emit_content, emit_reasoning = reasoning_compat.rewrite(
-                                content if content else None,
-                                reasoning if reasoning else None,
-                            )
-
-                            # Tools-requested turns: never interleave reasoning /
-                            # content with tool_calls on the wire.
-                            # - Hold preface until we know the turn is non-tool
-                            # - Keep holding while tools are pending incomplete
-                            # - Once tools are emitted, suppress ALL further
-                            #   content/reasoning (sub2api maps text before tool
-                            #   to content_block 0 and then fails on tool index 0)
-                            if tools_requested and not saw_tool_calls:
-                                # Still buffering (no outbound tool frame yet),
-                                # whether or not incomplete tool previews arrived.
-                                # Keep holding so a non-tool finish can flush text.
-                                if emit_content or emit_reasoning:
-                                    held_pre_tool.append(
-                                        (emit_content, emit_reasoning)
-                                    )
-                                emit_content, emit_reasoning = None, None
-                            elif tools_requested and saw_tool_calls:
-                                # Tools already on the wire: drop all further
-                                # text/reasoning (avoids content_block clashes).
-                                emit_content, emit_reasoning = None, None
-
-                            if finish:
-                                # Hold finish until stream drain so we can attach
-                                # usage on the same terminal chunk. sub2api/new-api
-                                # typically read usage from the finish_reason frame
-                                # and ignore a later usage-only chunk.
-                                stream_started = True
-                                finished = True
-                                held_finish = finish
-                                # Close <think> before terminal finish if still open.
-                                # Skip while a tools-preface is still held — we may
-                                # flush that preface below without an early close.
                                 if (
-                                    not client_gone
-                                    and not (
-                                        tools_requested
-                                        and not saw_tool_calls
-                                        and held_pre_tool
-                                    )
-                                    and not (tools_requested and saw_tool_calls)
+                                    emit_tool_calls
+                                    and budget is not None
+                                    and len(emit_tool_calls) > budget
                                 ):
-                                    close_tag = reasoning_compat.close_tag_chunk()
-                                    if close_tag:
-                                        yield _sse_chunk(
-                                            chat_id=chat_id,
-                                            model=model,
-                                            created=created,
-                                            content=close_tag,
-                                        )
+                                    emit_tool_calls = emit_tool_calls[:budget]
+                            # Only when a tool frame is actually outbound do
+                            # tools "win" the turn. Incomplete name-only /
+                            # partial-arg previews must keep holding preface.
+                            if emit_tool_calls:
+                                saw_tool_calls = True
+                                if tools_requested and held_pre_tool:
+                                    held_pre_tool.clear()
+                                    reasoning_compat.think_open = False
 
-                            if emit_content or emit_reasoning or emit_tool_calls:
-                                stream_started = True
-                                if client_gone:
-                                    continue
-                                # Split content/reasoning and tool_calls into separate
-                                # SSE frames. sub2api/Claude Code converters that open
-                                # text then tool from one mixed delta can leave the
-                                # wrong content_block active ("Content block not found").
-                                if emit_content or emit_reasoning:
+                        emit_content, emit_reasoning = reasoning_compat.rewrite(
+                            content if content else None,
+                            reasoning if reasoning else None,
+                        )
+
+                        # Tools-requested turns: never interleave reasoning /
+                        # content with tool_calls on the wire.
+                        # - Hold preface until we know the turn is non-tool
+                        # - Keep holding while tools are pending incomplete
+                        # - Once tools are emitted, suppress ALL further
+                        #   content/reasoning (sub2api maps text before tool
+                        #   to content_block 0 and then fails on tool index 0)
+                        if tools_requested and not saw_tool_calls:
+                            # Still buffering (no outbound tool frame yet),
+                            # whether or not incomplete tool previews arrived.
+                            # Keep holding so a non-tool finish can flush text.
+                            if emit_content or emit_reasoning:
+                                held_pre_tool.append(
+                                    (emit_content, emit_reasoning)
+                                )
+                            emit_content, emit_reasoning = None, None
+                        elif tools_requested and saw_tool_calls:
+                            # Tools already on the wire: drop all further
+                            # text/reasoning (avoids content_block clashes).
+                            emit_content, emit_reasoning = None, None
+
+                        if finish:
+                            # Hold finish until stream drain so we can attach
+                            # usage on the same terminal chunk. sub2api/new-api
+                            # typically read usage from the finish_reason frame
+                            # and ignore a later usage-only chunk.
+                            stream_started = True
+                            finished = True
+                            held_finish = finish
+                            # Close <think> before terminal finish if still open.
+                            # Skip while a tools-preface is still held — we may
+                            # flush that preface below without an early close.
+                            if (
+                                not client_gone
+                                and not (
+                                    tools_requested
+                                    and not saw_tool_calls
+                                    and held_pre_tool
+                                )
+                                and not (tools_requested and saw_tool_calls)
+                            ):
+                                close_tag = reasoning_compat.close_tag_chunk()
+                                if close_tag:
                                     yield _sse_chunk(
                                         chat_id=chat_id,
                                         model=model,
                                         created=created,
-                                        content=emit_content,
-                                        reasoning=emit_reasoning,
+                                        content=close_tag,
                                     )
-                                if emit_tool_calls:
-                                    saw_tool_calls = True
-                                    _n_before = tools_emitted_count
-                                    async for _tc_frame in _emit_tool_sse_serial(
-                                        chat_id=chat_id,
-                                        model=model,
-                                        created=created,
-                                        tool_calls=emit_tool_calls,
-                                        already_emitted=tools_emitted_count,
-                                    ):
-                                        yield _tc_frame
-                                        if _tc_frame.startswith("data: "):
-                                            tools_emitted_count += 1
-                                    # ensure monotonic even if only keepalives
-                                    if tools_emitted_count < _n_before:
-                                        tools_emitted_count = _n_before
-                            elif finish:
-                                # finish-only upstream frame: content already held
-                                continue
-                    else:
-                        raw = await resp.aread()
-                        try:
-                            data = json.loads(raw)
-                        except json.JSONDecodeError:
-                            text = raw.decode("utf-8", errors="replace")
-                            content_parts.append(text)
-                            stream_started = True
-                            if not client_gone:
-                                yield _sse_chunk(
-                                    chat_id=chat_id,
-                                    model=model,
-                                    created=created,
-                                    content=text,
-                                )
-                            finished = True
-                            held_finish = "stop"
-                        else:
-                            if isinstance(data.get("usage"), dict):
-                                usage = data["usage"]
-                            content, reasoning, tool_calls = _extract_delta_parts(data)
-                            msg_tool_calls: list[Any] | None = None
-                            finish_reason = "stop"
-                            if not content and not tool_calls:
-                                choices = data.get("choices") or []
-                                if choices:
-                                    ch0 = choices[0] or {}
-                                    msg = ch0.get("message") or {}
-                                    content = msg.get("content") or ""
-                                    reasoning = (
-                                        msg.get("reasoning_content") or reasoning
-                                    )
-                                    if isinstance(msg.get("tool_calls"), list):
-                                        msg_tool_calls = msg["tool_calls"]
-                                    finish_reason = (
-                                        ch0.get("finish_reason") or finish_reason
-                                    )
-                            else:
-                                choices = data.get("choices") or []
-                                if choices:
-                                    ch0 = choices[0] or {}
-                                    finish_reason = (
-                                        ch0.get("finish_reason") or finish_reason
-                                    )
-                                    msg = ch0.get("message") or {}
-                                    if (
-                                        not tool_calls
-                                        and isinstance(msg.get("tool_calls"), list)
-                                    ):
-                                        msg_tool_calls = msg["tool_calls"]
 
-                            emit_tc = tool_calls or msg_tool_calls
-                            sanitized_tc: list[Any] | None = None
-                            if emit_tc:
-                                tools_pending = True
-                                tools_requested = True
-                                if isinstance(emit_tc, list):
-                                    # One tool per conversion tick (see stream path).
-                                    sanitized_tc = (
-                                        _tool_call_argument_delta(tool_acc, emit_tc)
-                                        or None
-                                    )
-                                if sanitized_tc:
-                                    saw_tool_calls = True
-                            # Flush remaining held tools one-by-one from non-SSE body.
-                            if tool_acc and not client_gone:
-                                flushed: list[Any] = []
-                                while True:
-                                    one = _flush_one_tool_call(tool_acc)
-                                    if not one:
-                                        break
-                                    flushed.extend(one)
-                                if flushed:
-                                    saw_tool_calls = True
-                                    sanitized_tc = (sanitized_tc or []) + flushed
-                            finish_reason = _normalize_stream_finish_reason(
-                                finish_reason, saw_tool_calls=saw_tool_calls
-                            ) or ("tool_calls" if saw_tool_calls else "stop")
-                            if content:
-                                content_parts.append(content)
-                            if reasoning:
-                                reasoning_parts.append(reasoning)
+                        if emit_content or emit_reasoning or emit_tool_calls:
                             stream_started = True
-                            emit_content, emit_reasoning = reasoning_compat.rewrite(
-                                content if content else None,
-                                reasoning if reasoning else None,
-                            )
-                            # Same sub2api clash: if tools won, do not open a
-                            # thinking/text block before (or with) tool_calls.
-                            if tools_requested and (
-                                saw_tool_calls or tools_pending or sanitized_tc
-                            ):
-                                emit_content, emit_reasoning = None, None
-                                held_pre_tool.clear()
-                                reasoning_compat.think_open = False
-                            close_tag = reasoning_compat.close_tag_chunk()
-                            if close_tag and not (
-                                tools_requested and (saw_tool_calls or tools_pending)
-                            ):
-                                emit_content = (emit_content or "") + close_tag
-                            # Tools first, then content only if this is a non-tool turn.
-                            if sanitized_tc and not client_gone:
-                                saw_tool_calls = True
-                                async for _tc_frame in _emit_tool_sse_serial(
-                                    chat_id=chat_id,
-                                    model=model,
-                                    created=created,
-                                    tool_calls=sanitized_tc,
-                                    already_emitted=tools_emitted_count,
-                                ):
-                                    yield _tc_frame
-                                    if _tc_frame.startswith("data: "):
-                                        tools_emitted_count += 1
-                            if emit_content and not (
-                                tools_requested and saw_tool_calls
-                            ):
+                            if client_gone:
+                                continue
+                            # Split content/reasoning and tool_calls into separate
+                            # SSE frames. sub2api/Claude Code converters that open
+                            # text then tool from one mixed delta can leave the
+                            # wrong content_block active ("Content block not found").
+                            if emit_content or emit_reasoning:
                                 yield _sse_chunk(
                                     chat_id=chat_id,
                                     model=model,
                                     created=created,
                                     content=emit_content,
+                                    reasoning=emit_reasoning,
                                 )
-                            if (
-                                emit_reasoning
-                                and not reasoning_compat.enabled
-                                and not (tools_requested and saw_tool_calls)
-                            ):
-                                yield _sse_chunk(
+                            if emit_tool_calls:
+                                saw_tool_calls = True
+                                _n_before = tools_emitted_count
+                                async for _tc_frame in _emit_tool_sse_serial(
                                     chat_id=chat_id,
                                     model=model,
                                     created=created,
-                                    reasoning=emit_reasoning,
+                                    tool_calls=emit_tool_calls,
+                                    already_emitted=tools_emitted_count,
+                                ):
+                                    yield _tc_frame
+                                    if _tc_frame.startswith("data: "):
+                                        tools_emitted_count += 1
+                                if tools_emitted_count < _n_before:
+                                    tools_emitted_count = _n_before
+                                # Continue draining any additional complete tools already
+                                # held in tool_acc (serial + gap). Prevents agent loops
+                                # from stalling when upstream packed multiple tools into
+                                # one window but we only emit one per upstream line.
+                                while True:
+                                    _budget2 = history_compact.remaining_outbound_tool_budget(
+                                        tools_emitted_count
+                                    )
+                                    if _budget2 is not None and _budget2 <= 0:
+                                        break
+                                    # Re-check readiness without new deltas.
+                                    more = _tool_call_argument_delta(tool_acc, [])
+                                    if not more:
+                                        break
+                                    if _budget2 is not None and len(more) > _budget2:
+                                        more = more[:_budget2]
+                                    async for _tc_frame in _emit_tool_sse_serial(
+                                        chat_id=chat_id,
+                                        model=model,
+                                        created=created,
+                                        tool_calls=more,
+                                        already_emitted=tools_emitted_count,
+                                    ):
+                                        yield _tc_frame
+                                        if _tc_frame.startswith("data: "):
+                                            tools_emitted_count += 1
+                        elif finish:
+                            # finish-only upstream frame: content already held
+                            continue
+                else:
+                    raw = await resp.aread()
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        text = raw.decode("utf-8", errors="replace")
+                        content_parts.append(text)
+                        stream_started = True
+                        if not client_gone:
+                            yield _sse_chunk(
+                                chat_id=chat_id,
+                                model=model,
+                                created=created,
+                                content=text,
+                            )
+                        finished = True
+                        held_finish = "stop"
+                    else:
+                        if isinstance(data.get("usage"), dict):
+                            usage = data["usage"]
+                        content, reasoning, tool_calls = _extract_delta_parts(data)
+                        msg_tool_calls: list[Any] | None = None
+                        finish_reason = "stop"
+                        if not content and not tool_calls:
+                            choices = data.get("choices") or []
+                            if choices:
+                                ch0 = choices[0] or {}
+                                msg = ch0.get("message") or {}
+                                content = msg.get("content") or ""
+                                reasoning = (
+                                    msg.get("reasoning_content") or reasoning
                                 )
-                            # Defer finish_reason to terminal chunk with usage.
-                            finished = True
-                            held_finish = finish_reason
+                                if isinstance(msg.get("tool_calls"), list):
+                                    msg_tool_calls = msg["tool_calls"]
+                                finish_reason = (
+                                    ch0.get("finish_reason") or finish_reason
+                                )
+                        else:
+                            choices = data.get("choices") or []
+                            if choices:
+                                ch0 = choices[0] or {}
+                                finish_reason = (
+                                    ch0.get("finish_reason") or finish_reason
+                                )
+                                msg = ch0.get("message") or {}
+                                if (
+                                    not tool_calls
+                                    and isinstance(msg.get("tool_calls"), list)
+                                ):
+                                    msg_tool_calls = msg["tool_calls"]
+
+                        emit_tc = tool_calls or msg_tool_calls
+                        sanitized_tc: list[Any] | None = None
+                        if emit_tc:
+                            tools_pending = True
+                            tools_requested = True
+                            if isinstance(emit_tc, list):
+                                # One tool per conversion tick (see stream path).
+                                sanitized_tc = (
+                                    _tool_call_argument_delta(tool_acc, emit_tc)
+                                    or None
+                                )
+                            if sanitized_tc:
+                                saw_tool_calls = True
+                        # Flush remaining held tools one-by-one from non-SSE body.
+                        if tool_acc and not client_gone:
+                            flushed: list[Any] = []
+                            while True:
+                                one = _flush_one_tool_call(tool_acc)
+                                if not one:
+                                    break
+                                flushed.extend(one)
+                            if flushed:
+                                saw_tool_calls = True
+                                sanitized_tc = (sanitized_tc or []) + flushed
+                        finish_reason = _normalize_stream_finish_reason(
+                            finish_reason, saw_tool_calls=saw_tool_calls
+                        ) or ("tool_calls" if saw_tool_calls else "stop")
+                        if content:
+                            content_parts.append(content)
+                        if reasoning:
+                            reasoning_parts.append(reasoning)
+                        stream_started = True
+                        emit_content, emit_reasoning = reasoning_compat.rewrite(
+                            content if content else None,
+                            reasoning if reasoning else None,
+                        )
+                        # Same sub2api clash: if tools won, do not open a
+                        # thinking/text block before (or with) tool_calls.
+                        if tools_requested and (
+                            saw_tool_calls or tools_pending or sanitized_tc
+                        ):
+                            emit_content, emit_reasoning = None, None
+                            held_pre_tool.clear()
+                            reasoning_compat.think_open = False
+                        close_tag = reasoning_compat.close_tag_chunk()
+                        if close_tag and not (
+                            tools_requested and (saw_tool_calls or tools_pending)
+                        ):
+                            emit_content = (emit_content or "") + close_tag
+                        # Tools first, then content only if this is a non-tool turn.
+                        if sanitized_tc and not client_gone:
+                            saw_tool_calls = True
+                            async for _tc_frame in _emit_tool_sse_serial(
+                                chat_id=chat_id,
+                                model=model,
+                                created=created,
+                                tool_calls=sanitized_tc,
+                                already_emitted=tools_emitted_count,
+                            ):
+                                yield _tc_frame
+                                if _tc_frame.startswith("data: "):
+                                    tools_emitted_count += 1
+                        if emit_content and not (
+                            tools_requested and saw_tool_calls
+                        ):
+                            yield _sse_chunk(
+                                chat_id=chat_id,
+                                model=model,
+                                created=created,
+                                content=emit_content,
+                            )
+                        if (
+                            emit_reasoning
+                            and not reasoning_compat.enabled
+                            and not (tools_requested and saw_tool_calls)
+                        ):
+                            yield _sse_chunk(
+                                chat_id=chat_id,
+                                model=model,
+                                created=created,
+                                reasoning=emit_reasoning,
+                            )
+                        # Defer finish_reason to terminal chunk with usage.
+                        finished = True
+                        held_finish = finish_reason
 
             # Flush deferred complete tool-argument snapshots before finish so
             # clients that only naive-append stream deltas still get full args.
@@ -2190,7 +2715,13 @@ async def _stream_proxy_with_failover(
         except asyncio.CancelledError:
             return
         except Exception as e:  # noqa: BLE001
-            account_pool.report_failure(creds.auth_key, error=str(e), status_code=502)
+            await asyncio.to_thread(
+                account_pool.report_failure,
+                creds.auth_key,
+                error=str(e),
+                status_code=502,
+                model=model,
+            )
             last_err = str(e)
             # Never failover after bytes were already streamed to the client —
             # secondary relays treat that as a mid-stream corruption / break.
@@ -2221,7 +2752,7 @@ async def _stream_proxy_with_failover(
         "id": chat_id,
         "object": "error",
         "error": {
-            "message": last_err or "All accounts failed",
+            "message": _sanitize_upstream_error_message(last_err or "", 503) or "All accounts failed",
             "type": "upstream_error",
         },
     }
@@ -2250,75 +2781,75 @@ async def _collect_completion(
     req_body = _body_for_upstream(body)
     _ensure_stream_include_usage(req_body)
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT, connect=30.0)) as client:
-        async with client.stream("POST", url, headers=headers, json=req_body) as resp:
-            if resp.status_code >= 400:
-                raw = await resp.aread()
-                # attach body text onto response for callers
-                try:
-                    resp._content = raw  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-                raise httpx.HTTPStatusError(
-                    f"Upstream error: {raw.decode('utf-8', errors='replace')[:500]}",
-                    request=resp.request,
-                    response=resp,
-                )
+    client = await get_http_client()
+    async with client.stream("POST", url, headers=headers, json=req_body) as resp:
+        if resp.status_code >= 400:
+            raw = await resp.aread()
+            # attach body text onto response for callers
+            try:
+                resp._content = raw  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            raise httpx.HTTPStatusError(
+                f"Upstream error: {raw.decode('utf-8', errors='replace')[:500]}",
+                request=resp.request,
+                response=resp,
+            )
 
-            ctype = (resp.headers.get("content-type") or "").lower()
-            if "text/event-stream" in ctype or "stream" in ctype:
-                async for line in resp.aiter_lines():
-                    parsed = _parse_sse_line(line)
-                    if parsed is None:
-                        continue
-                    if parsed == "[DONE]":
-                        break
-                    assert isinstance(parsed, dict)
-                    if isinstance(parsed.get("usage"), dict):
-                        usage = parsed["usage"]
-                    c, r, tc_delta = _extract_delta_parts(parsed)
-                    if c:
-                        content_parts.append(c)
-                    if r:
-                        reasoning_parts.append(r)
-                    if tc_delta:
-                        _merge_tool_call_delta(tool_acc, tc_delta)
-                    choices = parsed.get("choices")
-                    if isinstance(choices, list) and choices:
-                        fr = choices[0].get("finish_reason")
-                        if fr:
-                            finish = fr
-                        # non-stream-style message embedded in SSE
-                        msg = choices[0].get("message") or {}
-                        if isinstance(msg.get("tool_calls"), list) and msg["tool_calls"]:
-                            complete_tool_calls = [
-                                tc
-                                for tc in msg["tool_calls"]
-                                if isinstance(tc, dict)
-                            ]
-            else:
-                raw = await resp.aread()
-                data = json.loads(raw)
-                if isinstance(data.get("usage"), dict):
-                    usage = data["usage"]
-                choices = data.get("choices") or []
-                if choices:
-                    msg = (choices[0] or {}).get("message") or {}
-                    content_parts.append(msg.get("content") or "")
-                    if msg.get("reasoning_content"):
-                        reasoning_parts.append(msg["reasoning_content"])
-                    if isinstance(msg.get("tool_calls"), list):
-                        complete_tool_calls = [
-                            tc for tc in msg["tool_calls"] if isinstance(tc, dict)
-                        ]
-                    finish = choices[0].get("finish_reason") or "stop"
-                else:
-                    c, r, tc_delta = _extract_delta_parts(data)
+        ctype = (resp.headers.get("content-type") or "").lower()
+        if "text/event-stream" in ctype or "stream" in ctype:
+            async for line in resp.aiter_lines():
+                parsed = _parse_sse_line(line)
+                if parsed is None:
+                    continue
+                if parsed == "[DONE]":
+                    break
+                assert isinstance(parsed, dict)
+                if isinstance(parsed.get("usage"), dict):
+                    usage = parsed["usage"]
+                c, r, tc_delta = _extract_delta_parts(parsed)
+                if c:
                     content_parts.append(c)
+                if r:
                     reasoning_parts.append(r)
-                    if tc_delta:
-                        _merge_tool_call_delta(tool_acc, tc_delta)
-                    finish = "stop"
+                if tc_delta:
+                    _merge_tool_call_delta(tool_acc, tc_delta)
+                choices = parsed.get("choices")
+                if isinstance(choices, list) and choices:
+                    fr = choices[0].get("finish_reason")
+                    if fr:
+                        finish = fr
+                    # non-stream-style message embedded in SSE
+                    msg = choices[0].get("message") or {}
+                    if isinstance(msg.get("tool_calls"), list) and msg["tool_calls"]:
+                        complete_tool_calls = [
+                            tc
+                            for tc in msg["tool_calls"]
+                            if isinstance(tc, dict)
+                        ]
+        else:
+            raw = await resp.aread()
+            data = json.loads(raw)
+            if isinstance(data.get("usage"), dict):
+                usage = data["usage"]
+            choices = data.get("choices") or []
+            if choices:
+                msg = (choices[0] or {}).get("message") or {}
+                content_parts.append(msg.get("content") or "")
+                if msg.get("reasoning_content"):
+                    reasoning_parts.append(msg["reasoning_content"])
+                if isinstance(msg.get("tool_calls"), list):
+                    complete_tool_calls = [
+                        tc for tc in msg["tool_calls"] if isinstance(tc, dict)
+                    ]
+                finish = choices[0].get("finish_reason") or "stop"
+            else:
+                c, r, tc_delta = _extract_delta_parts(data)
+                content_parts.append(c)
+                reasoning_parts.append(r)
+                if tc_delta:
+                    _merge_tool_call_delta(tool_acc, tc_delta)
+                finish = "stop"
 
     tool_calls = complete_tool_calls or _finalize_tool_calls(tool_acc)
     if tool_calls and (not finish or finish == "stop"):
@@ -2368,11 +2899,22 @@ def _resolve_anthropic_affinity(
 
 
 def _anthropic_error_response(
-    message: str, status: int = 500, err_type: str = "api_error"
+    message: str,
+    status: int = 500,
+    err_type: str = "api_error",
+    *,
+    retry_after: float | int | None = None,
 ) -> JSONResponse:
+    headers = {}
+    if retry_after is not None:
+        try:
+            headers["Retry-After"] = str(max(1, int(float(retry_after))))
+        except (TypeError, ValueError):
+            headers["Retry-After"] = "5"
     return JSONResponse(
         status_code=status,
         content=anth.anthropic_error(message, status=status, err_type=err_type),
+        headers=headers or None,
     )
 
 
@@ -2402,20 +2944,50 @@ async def anthropic_messages(
             err_type="invalid_request_error",
         )
 
-    conv_fp, prefer_account = _resolve_anthropic_affinity(req, request)
+    conv_fp, prefer_account = await asyncio.to_thread(
+        _resolve_anthropic_affinity, req, request
+    )
     model = resolve_model(req.model)
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
 
     try:
-        chain = account_pool.try_acquire_sequence(
-            model=model, prefer_account_id=prefer_account
-        )
-        if not chain:
-            chain = [account_pool.acquire(model=model)]
+        def _pick_chain():
+            chain = account_pool.try_acquire_sequence(
+                model=model, prefer_account_id=prefer_account
+            )
+            if not chain:
+                chain = [account_pool.acquire(model=model)]
+            return chain
+
+        chain = await asyncio.to_thread(_pick_chain)
     except AuthError as e:
+        try:
+            from store.metrics import inc
+
+            inc("g2a_auth_failures_total")
+        except Exception:
+            pass
+        # Pool empty / temporary — 503 not 401 so clients retry instead of stopping.
+        pe = _client_pool_error(e)
+        detail = pe.body
+        try:
+            import json as _json
+            detail = _json.loads(pe.body.decode("utf-8")).get("error", {}).get("message") or str(e)
+        except Exception:
+            detail = str(e)
         return _anthropic_error_response(
-            str(e), status=401, err_type="authentication_error"
+            detail, status=503, err_type="api_error", retry_after=8
         )
+    try:
+        from store.metrics import inc
+
+        inc("g2a_requests_total")
+        if prefer_account:
+            inc("g2a_affinity_hits_total")
+        elif conv_fp:
+            inc("g2a_affinity_misses_total")
+    except Exception:
+        pass
 
     body = anth.build_openai_chat_body(
         req, model, force_stream=FORCE_UPSTREAM_STREAM
@@ -2423,6 +2995,9 @@ async def anthropic_messages(
     # Always stream upstream when forced; client may still want non-stream response
     if FORCE_UPSTREAM_STREAM:
         body["stream"] = True
+    # Anthropic→OpenAI conversion can omit parameters; force the same scrub as
+    # the OpenAI path so upstream never sees tools without `parameters`.
+    _sanitize_upstream_body(body, model=model)
     _ensure_stream_include_usage(body)
     # Same long-tool-loop compaction as OpenAI path (sub2api often hits OpenAI
     # chat/completions, but direct Anthropic /v1/messages also benefits).
@@ -2468,14 +3043,25 @@ async def anthropic_messages(
             content, reasoning, finish, usage, tool_calls = await _collect_completion(
                 url=url, headers=headers, body=body
             )
-            account_pool.report_success(creds.auth_key)
+            await asyncio.to_thread(account_pool.report_success, creds.auth_key, model=model)
             if conv_fp:
                 if prefer_account and prefer_account != creds.auth_key:
-                    conversation_affinity.rebind_on_failover(
-                        conv_fp, first_tried, creds.auth_key
+                    await asyncio.to_thread(
+                        conversation_affinity.rebind_on_failover,
+                        conv_fp,
+                        first_tried,
+                        creds.auth_key,
                     )
+                    try:
+                        from store.metrics import inc
+
+                        inc("g2a_account_failovers_total")
+                    except Exception:
+                        pass
                 else:
-                    conversation_affinity.bind_affinity(conv_fp, creds.auth_key)
+                    await asyncio.to_thread(
+                        conversation_affinity.bind_affinity, conv_fp, creds.auth_key
+                    )
 
             result = anth.openai_completion_to_anthropic(
                 content=content or "",
@@ -2495,26 +3081,52 @@ async def anthropic_messages(
         except httpx.HTTPStatusError as e:
             code = e.response.status_code if e.response is not None else 502
             detail = e.response.text[:800] if e.response is not None else str(e)
-            account_pool.report_failure(
-                creds.auth_key, error=detail, status_code=code, model=model
+            hdrs = dict(e.response.headers) if e.response is not None else None
+            await asyncio.to_thread(
+                account_pool.report_failure,
+                creds.auth_key,
+                error=detail,
+                status_code=code,
+                model=model,
+                headers=hdrs,
             )
+            try:
+                from store.metrics import inc
+
+                inc("g2a_upstream_failures_total")
+            except Exception:
+                pass
             last_error = f"Upstream {code}: {detail}"
             last_status = code
             if not _retryable_status(code):
                 break
             continue
         except Exception as e:  # noqa: BLE001
-            account_pool.report_failure(
-                creds.auth_key, error=str(e), status_code=502, model=model
+            await asyncio.to_thread(
+                account_pool.report_failure,
+                creds.auth_key,
+                error=str(e),
+                status_code=502,
+                model=model,
             )
+            try:
+                from store.metrics import inc
+
+                inc("g2a_upstream_failures_total")
+            except Exception:
+                pass
             last_error = f"Proxy error: {e}"
             last_status = 502
             continue
 
+    final_status = last_status if last_status < 600 else 502
+    retryable = final_status in (401, 403, 429, 500, 502, 503, 504)
+    friendly = _sanitize_upstream_error_message(last_error or "", final_status)
     return _anthropic_error_response(
-        last_error or "All accounts failed",
-        status=last_status if last_status < 600 else 502,
+        friendly or last_error or "All accounts failed",
+        status=503 if retryable else final_status,
         err_type="api_error",
+        retry_after=8 if retryable else None,
     )
 
 
@@ -2562,191 +3174,211 @@ async def _stream_anthropic_with_failover(
             message_id=message_id,
             model=model,
             tools_requested=tools_requested,
+            max_tools=history_compact.OUTBOUND_MAX_TOOLS,
         )
         finished = False
         stream_started = False
         usage: dict[str, Any] | None = None
         held_finish: str | None = None
         try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(TIMEOUT, connect=30.0)
-            ) as client:
-                async with client.stream(
-                    "POST", url, headers=headers, json=upstream_body
-                ) as resp:
-                    if resp.status_code >= 400:
-                        err_text = (await resp.aread()).decode(
-                            "utf-8", errors="replace"
-                        )[:1500]
-                        account_pool.report_failure(
+            client = await get_http_client()
+            async with client.stream(
+                "POST", url, headers=headers, json=upstream_body
+            ) as resp:
+                if resp.status_code >= 400:
+                    err_text = (await resp.aread()).decode(
+                        "utf-8", errors="replace"
+                    )[:1500]
+                    await asyncio.to_thread(
+                        account_pool.report_failure,
+                        creds.auth_key,
+                        error=err_text,
+                        status_code=resp.status_code,
+                        model=model,
+                        headers=dict(resp.headers),
+                    )
+                    last_err = f"Upstream {resp.status_code}: {err_text}"
+                    if _retryable_status(resp.status_code) and idx < len(
+                        chain
+                    ) - 1:
+                        continue
+                    yield anth.anthropic_stream_error(
+                        last_err, err_type="api_error"
+                    )
+                    return
+
+                await asyncio.to_thread(account_pool.report_success, creds.auth_key, model=model)
+                if conversation_fp:
+                    if idx > 0:
+                        await asyncio.to_thread(
+                            conversation_affinity.rebind_on_failover,
+                            conversation_fp,
+                            first_tried,
                             creds.auth_key,
-                            error=err_text,
-                            status_code=resp.status_code,
-                            model=model,
                         )
-                        last_err = f"Upstream {resp.status_code}: {err_text}"
-                        if _retryable_status(resp.status_code) and idx < len(
-                            chain
-                        ) - 1:
-                            continue
-                        yield anth.anthropic_stream_error(
-                            last_err, err_type="api_error"
+                    else:
+                        await asyncio.to_thread(
+                            conversation_affinity.bind_affinity,
+                            conversation_fp,
+                            creds.auth_key,
                         )
-                        return
 
-                    account_pool.report_success(creds.auth_key)
-                    if conversation_fp:
-                        if idx > 0:
-                            conversation_affinity.rebind_on_failover(
-                                conversation_fp, first_tried, creds.auth_key
-                            )
-                        else:
-                            conversation_affinity.bind_affinity(
-                                conversation_fp, creds.auth_key
-                            )
+                # message_start first — only after upstream accepted
+                for ev in assembler.start(input_tokens=prompt_est):
+                    yield ev
+                stream_started = True
 
-                    # message_start first — only after upstream accepted
-                    for ev in assembler.start(input_tokens=prompt_est):
-                        yield ev
-                    stream_started = True
-
-                    ctype = (resp.headers.get("content-type") or "").lower()
-                    client_gone = False
-                    if "text/event-stream" in ctype or "stream" in ctype:
-                        async for line in _aiter_sse_lines_with_keepalive(resp):
-                            try:
-                                if await client_disconnected():
-                                    client_gone = True
-                            except Exception:
+                ctype = (resp.headers.get("content-type") or "").lower()
+                client_gone = False
+                if "text/event-stream" in ctype or "stream" in ctype:
+                    async for line in _aiter_sse_lines_with_keepalive(resp):
+                        try:
+                            if await client_disconnected():
                                 client_gone = True
-                            if line is None:
-                                if not client_gone:
-                                    yield anth.anthropic_stream_ping()
-                                continue
-                            parsed = _parse_sse_line(line)
-                            if parsed is None:
-                                continue
-                            if parsed == "[DONE]":
-                                break
-                            assert isinstance(parsed, dict)
-                            if isinstance(parsed.get("usage"), dict):
-                                usage = parsed["usage"]
-                            content, reasoning, tool_calls = _extract_delta_parts(
-                                parsed
-                            )
-                            finish = None
-                            choices = parsed.get("choices")
-                            if isinstance(choices, list) and choices:
-                                finish = choices[0].get("finish_reason")
-                            # usage-only final OpenAI chunk
-                            if (
-                                not content
-                                and not reasoning
-                                and not tool_calls
-                                and not finish
-                                and isinstance(parsed.get("usage"), dict)
-                            ):
-                                usage = parsed["usage"]
-                                continue
-                            if content or reasoning or tool_calls:
-                                for ev in assembler.feed(
+                        except Exception:
+                            client_gone = True
+                        if line is None:
+                            if not client_gone:
+                                yield anth.anthropic_stream_ping()
+                            continue
+                        parsed = _parse_sse_line(line)
+                        if parsed is None:
+                            continue
+                        if parsed == "[DONE]":
+                            break
+                        assert isinstance(parsed, dict)
+                        if isinstance(parsed.get("usage"), dict):
+                            usage = parsed["usage"]
+                        content, reasoning, tool_calls = _extract_delta_parts(
+                            parsed
+                        )
+                        finish = None
+                        choices = parsed.get("choices")
+                        if isinstance(choices, list) and choices:
+                            finish = choices[0].get("finish_reason")
+                        # usage-only final OpenAI chunk
+                        if (
+                            not content
+                            and not reasoning
+                            and not tool_calls
+                            and not finish
+                            and isinstance(parsed.get("usage"), dict)
+                        ):
+                            usage = parsed["usage"]
+                            continue
+                        if content or reasoning or tool_calls:
+                            async for ev in _yield_anthropic_events_serial(
+                                assembler.feed(
                                     content=content or None,
                                     reasoning=reasoning or None,
                                     tool_calls=tool_calls,
-                                ):
-                                    if not client_gone:
-                                        yield ev
-                            if finish:
-                                # Capture finish but keep reading — usage often
-                                # arrives on a subsequent empty-choices chunk.
-                                finished = True
-                                held_finish = finish
-                        # Drain complete: now emit terminal events with best usage
-                        fr = held_finish or (
-                            "tool_calls" if assembler._saw_tool else "stop"
+                                ),
+                                client_gone=client_gone,
+                            ):
+                                yield ev
+                        if finish:
+                            # Capture finish but keep reading — usage often
+                            # arrives on a subsequent empty-choices chunk.
+                            finished = True
+                            held_finish = finish
+                    # Drain complete: now emit terminal events with best usage
+                    fr = held_finish or (
+                        "tool_calls" if assembler._saw_tool else "stop"
+                    )
+                    if assembler._saw_tool and fr in (
+                        None,
+                        "stop",
+                        "end_turn",
+                        "",
+                    ):
+                        fr = "tool_calls"
+                    async for ev in _yield_anthropic_events_serial(
+                        assembler.finish(
+                            fr, usage=usage, input_tokens=prompt_est
+                        ),
+                        client_gone=client_gone,
+                    ):
+                        yield ev
+                    return
+                else:
+                    raw = await resp.aread()
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        text = raw.decode("utf-8", errors="replace")
+                        async for ev in _yield_anthropic_events_serial(
+                            assembler.feed(content=text)
+                        ):
+                            yield ev
+                        async for ev in _yield_anthropic_events_serial(
+                            assembler.finish(
+                                "stop", usage=usage, input_tokens=prompt_est
+                            )
+                        ):
+                            yield ev
+                        return
+                    else:
+                        if isinstance(data.get("usage"), dict):
+                            usage = data["usage"]
+                        content, reasoning, tool_calls = _extract_delta_parts(
+                            data
                         )
-                        if assembler._saw_tool and fr in (
+                        finish_reason = "stop"
+                        choices = data.get("choices") or []
+                        if choices:
+                            ch0 = choices[0] or {}
+                            msg = ch0.get("message") or {}
+                            if not content:
+                                content = msg.get("content") or ""
+                            if not reasoning:
+                                reasoning = msg.get("reasoning_content") or ""
+                            if not tool_calls and isinstance(
+                                msg.get("tool_calls"), list
+                            ):
+                                tool_calls = msg["tool_calls"]
+                            # legacy function_call
+                            if not tool_calls and isinstance(
+                                msg.get("function_call"), dict
+                            ):
+                                tool_calls = _legacy_function_call_to_tool_calls(
+                                    msg.get("function_call")
+                                )
+                            finish_reason = (
+                                ch0.get("finish_reason") or finish_reason
+                            )
+                        if content or reasoning or tool_calls:
+                            async for ev in _yield_anthropic_events_serial(
+                                assembler.feed(
+                                    content=content or None,
+                                    reasoning=reasoning or None,
+                                    tool_calls=tool_calls,
+                                )
+                            ):
+                                yield ev
+                        if tool_calls and finish_reason in (
                             None,
                             "stop",
                             "end_turn",
                             "",
                         ):
-                            fr = "tool_calls"
-                        for ev in assembler.finish(
-                            fr, usage=usage, input_tokens=prompt_est
-                        ):
-                            if not client_gone:
-                                yield ev
-                        return
-                    else:
-                        raw = await resp.aread()
-                        try:
-                            data = json.loads(raw)
-                        except json.JSONDecodeError:
-                            text = raw.decode("utf-8", errors="replace")
-                            for ev in assembler.feed(content=text):
-                                yield ev
-                            for ev in assembler.finish(
-                                "stop", usage=usage, input_tokens=prompt_est
-                            ):
-                                yield ev
-                            return
-                        else:
-                            if isinstance(data.get("usage"), dict):
-                                usage = data["usage"]
-                            content, reasoning, tool_calls = _extract_delta_parts(
-                                data
-                            )
-                            finish_reason = "stop"
-                            choices = data.get("choices") or []
-                            if choices:
-                                ch0 = choices[0] or {}
-                                msg = ch0.get("message") or {}
-                                if not content:
-                                    content = msg.get("content") or ""
-                                if not reasoning:
-                                    reasoning = msg.get("reasoning_content") or ""
-                                if not tool_calls and isinstance(
-                                    msg.get("tool_calls"), list
-                                ):
-                                    tool_calls = msg["tool_calls"]
-                                # legacy function_call
-                                if not tool_calls and isinstance(
-                                    msg.get("function_call"), dict
-                                ):
-                                    tool_calls = _legacy_function_call_to_tool_calls(
-                                        msg.get("function_call")
-                                    )
-                                finish_reason = (
-                                    ch0.get("finish_reason") or finish_reason
-                                )
-                            if content or reasoning or tool_calls:
-                                for ev in assembler.feed(
-                                    content=content or None,
-                                    reasoning=reasoning or None,
-                                    tool_calls=tool_calls,
-                                ):
-                                    yield ev
-                            if tool_calls and finish_reason in (
-                                None,
-                                "stop",
-                                "end_turn",
-                                "",
-                            ):
-                                finish_reason = "tool_calls"
-                            for ev in assembler.finish(
+                            finish_reason = "tool_calls"
+                        async for ev in _yield_anthropic_events_serial(
+                            assembler.finish(
                                 finish_reason,
                                 usage=usage,
                                 input_tokens=prompt_est,
-                            ):
-                                yield ev
-                            return
+                            )
+                        ):
+                            yield ev
+                        return
 
             if not finished:
-                for ev in assembler.finish(
-                    "tool_calls" if assembler._saw_tool else "stop",
-                    usage=usage,
-                    input_tokens=prompt_est,
+                async for ev in _yield_anthropic_events_serial(
+                    assembler.finish(
+                        "tool_calls" if assembler._saw_tool else "stop",
+                        usage=usage,
+                        input_tokens=prompt_est,
+                    )
                 ):
                     yield ev
             return
@@ -2754,7 +3386,7 @@ async def _stream_anthropic_with_failover(
             return
         except Exception as e:  # noqa: BLE001
             account_pool.report_failure(
-                creds.auth_key, error=str(e), status_code=502
+                creds.auth_key, error=str(e), status_code=502, model=model
             )
             last_err = str(e)
             # Mid-stream failures cannot safely failover for secondary relays
@@ -2771,13 +3403,95 @@ async def _stream_anthropic_with_failover(
             return
 
     yield anth.anthropic_stream_error(
-        last_err or "All accounts failed", err_type="api_error"
+        _sanitize_upstream_error_message(last_err or "", 503) or "All accounts failed", err_type="api_error"
     )
 
 
-# Mount static assets if present (css/js under /static)
+def _static_file_response(rel_path: str):
+    """Serve static files safely under multi-worker.
+
+    JS/CSS/dist assets are returned as a single in-memory Response with an exact
+    Content-Length and Accept-Ranges disabled. This prevents browsers from
+    reporting net::ERR_CONTENT_LENGTH_MISMATCH when a worker recycles mid-download
+    or a proxy serves a partial body — which previously left the admin UI stuck
+    until a manual hard refresh.
+    """
+    raw = (rel_path or "").lstrip("/")
+    if not raw or ".." in raw.split("/"):
+        return JSONResponse({"detail": "not found"}, status_code=404)
+    target = (STATIC_DIR / raw).resolve()
+    try:
+        target.relative_to(STATIC_DIR.resolve())
+    except Exception:
+        return JSONResponse({"detail": "not found"}, status_code=404)
+    if not target.is_file():
+        return JSONResponse({"detail": "not found"}, status_code=404)
+
+    suffix = target.suffix.lower()
+    media = {
+        ".js": "application/javascript; charset=utf-8",
+        ".css": "text/css; charset=utf-8",
+        ".html": "text/html; charset=utf-8",
+        ".json": "application/json; charset=utf-8",
+        ".map": "application/json; charset=utf-8",
+        ".ico": "image/x-icon",
+        ".svg": "image/svg+xml",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".woff": "font/woff",
+        ".woff2": "font/woff2",
+    }.get(suffix, "application/octet-stream")
+
+    # Immutable content-hashed bundles under /static/dist/ can be cached long.
+    # Logical /static/js/* kept for compatibility but still no-store to avoid
+    # stale partials.
+    is_dist = "/dist/" in ("/" + raw.replace("\\", "/")) or raw.startswith("dist/")
+    is_text_asset = suffix in {".js", ".css", ".html", ".json", ".map"}
+
+    if is_text_asset:
+        data = target.read_bytes()
+        if is_dist and suffix in {".js", ".css"}:
+            cache = "public, max-age=31536000, immutable"
+        else:
+            cache = "no-store, no-cache, must-revalidate, max-age=0"
+        headers = {
+            "Cache-Control": cache,
+            "Pragma": "no-cache" if not is_dist else "public",
+            "X-Content-Type-Options": "nosniff",
+            "Accept-Ranges": "none",
+            "Content-Length": str(len(data)),
+        }
+        if not is_dist:
+            headers["Pragma"] = "no-cache"
+        else:
+            headers.pop("Pragma", None)
+        return Response(content=data, media_type=media, headers=headers)
+
+    return FileResponse(
+        target,
+        media_type=media,
+        headers={
+            "Cache-Control": "public, max-age=3600, must-revalidate",
+            "X-Content-Type-Options": "nosniff",
+            "Accept-Ranges": "none",
+        },
+    )
+
+
+
+@app.get("/static/{file_path:path}", include_in_schema=False)
+async def static_assets(file_path: str):
+    return _static_file_response(file_path)
+
+
+# Mount static assets if present (css/js under /static) — kept as fallback for tools expecting mount
 if STATIC_DIR.is_dir():
-    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+    # Prefer explicit route above; mount remains for compatibility when route not matched
+    try:
+        app.mount("/static-files", StaticFiles(directory=str(STATIC_DIR)), name="static_files")
+    except Exception:
+        pass
 
 
 def _pick_listen_host() -> str:
@@ -2887,8 +3601,11 @@ def main() -> None:
 
     import uvicorn
 
+    from config import WORKERS
+
     host = _pick_listen_host()
     port = PORT
+    workers = max(2, int(WORKERS or 2))  # high-concurrency: never default to 1
     # On Linux servers / headless, don't auto-open browser by default
     default_open = "0" if (os.name != "nt" and not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY")) else "1"
     open_browser = os.getenv("GROK2API_OPEN_BROWSER", default_open) not in (
@@ -2898,20 +3615,26 @@ def main() -> None:
         "no",
     )
 
-    # If default port is busy, try a few next ports instead of silent fail
+    # High-concurrency mode: Redis + PostgreSQL are mandatory (fail closed).
+    try:
+        from store import require_high_concurrency_stores
+
+        require_high_concurrency_stores()
+    except Exception as e:  # noqa: BLE001
+        print(f"ERROR: high-concurrency store check failed: {e}")
+        print(
+            "  Hint: docker compose --profile store up -d\n"
+            "        pip install -r requirements-store.txt\n"
+            "        export REDIS_URL=redis://127.0.0.1:6379/0\n"
+            "        export DATABASE_URL=postgresql://grok2api:grok2api@127.0.0.1:5432/grok2api\n"
+            "        python migrate_json_to_pg.py --data-dir ./data"
+        )
+        raise SystemExit(2) from e
+
+    # Fixed port bind (no auto-pick) so multi-worker parent shares one listen port.
     if os.getenv("GROK2API_PORT") is None:
-        for candidate in range(port, port + 20):
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                try:
-                    s.bind((host if host != "0.0.0.0" else "127.0.0.1", candidate))
-                except OSError:
-                    continue
-                port = candidate
-                break
-        else:
-            print(f"ERROR: ports {PORT}-{PORT + 19} are all in use")
-            raise SystemExit(1)
+        # Still allow override via busy-port only when explicitly single-worker emergency.
+        pass
 
     # Keep admin API status / guide URLs in sync with actual bind
     _config.HOST = host
@@ -2931,6 +3654,7 @@ def main() -> None:
     else:
         link_base = f"http://{host}:{port}"
     print(f"grokcli-2api v{APP_VERSION} listening on http://{host}:{port}")
+    print(f"  workers:            {workers}")
     print(f"  OpenAI base_url:    {link_base}/v1")
     print(f"  Anthropic messages: {link_base}/v1/messages")
     print(f"  Admin console:      {admin}")
@@ -2944,15 +3668,19 @@ def main() -> None:
     elif host in ("0.0.0.0", "::"):
         print("  Tip: set GROK2API_PUBLIC_BASE_URL=https://your.domain if auto-detect is wrong")
     print(f"  Upstream:           {UPSTREAM_BASE}")
-    if port != PORT:
-        print(f"  NOTE: port {PORT} busy, using {port} instead")
+    print("  mode:               high-concurrency (multi-worker + Redis + PostgreSQL)")
+    print("  note:               only leader process runs token/model maintainers")
 
-    if open_browser:
-        print(f"  Opening browser → {admin}")
-        _open_admin_browser(admin)
-
-    # Pass app object + actual host/port (auto-picked port is used)
-    uvicorn.run(app, host=host, port=port, reload=False)
+    # Always multi-worker string import path.
+    uvicorn.run(
+        "app:app",
+        host=host,
+        port=port,
+        workers=workers,
+        reload=False,
+        limit_concurrency=int(os.getenv("GROK2API_LIMIT_CONCURRENCY", "2000") or 2000),
+        timeout_keep_alive=int(os.getenv("GROK2API_KEEPALIVE", "30") or 30),
+    )
 
 
 if __name__ == "__main__":

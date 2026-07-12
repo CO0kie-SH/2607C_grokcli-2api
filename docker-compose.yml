@@ -1,11 +1,41 @@
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: grokcli-2api-redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: grokcli-2api-postgres
+    environment:
+      POSTGRES_USER: grok2api
+      POSTGRES_PASSWORD: grok2api
+      POSTGRES_DB: grok2api
+    ports:
+      - "5432:5432"
+    volumes:
+      - grok2api_pg:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U grok2api -d grok2api"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   grokcli-2api:
     build:
       context: .
       dockerfile: Dockerfile
     image: grokcli-2api:local
     container_name: grokcli-2api
-    # Copy template first: cp .env.example .env  (then edit secrets)
     env_file:
       - path: .env
         required: false
@@ -15,26 +45,49 @@ services:
       GROK2API_HOST: "0.0.0.0"
       GROK2API_PORT: "3000"
       GROK2API_OPEN_BROWSER: "0"
-      # Keep maintainers ON; defaults in config.py already throttle large pools.
       GROK2API_TOKEN_MAINTAIN: "1"
       GROK2API_MODEL_HEALTH: "1"
-      # Keep reasoning in reasoning_content (recommended for sub2api / Claude Code).
-      # Only set think_tag for relays that only read delta.content.
       GROK2API_REASONING_COMPAT: "off"
-      # Optional tuning for 400+ accounts:
-      # GROK2API_TOKEN_MAINTAIN_INTERVAL: "180"
-      # GROK2API_MODEL_HEALTH_INTERVAL: "900"
-      # GROK2API_TOKEN_REFRESH_WORKERS: "2"
-      # GROK2API_MODEL_PROBE_WORKERS: "2"
-      # GROK2API_TOKEN_REFRESH_BATCH: "20"
-      # GROK2API_MODEL_PROBE_BATCH: "15"
-      # Optional secrets / mail / proxy / public origin:
-      # GROK2API_ADMIN_PASSWORD: "change-me"
-      # GROK2API_MOEMAIL_API_KEY: ""
-      # GROK2API_MOEMAIL_BASE_URL: "https://moemail.example.com"
-      # GROK2API_MOEMAIL_DOMAIN: "example.com"
-      # GROK2API_XAI_PROXY: ""
-      # GROK2API_PUBLIC_BASE_URL: "https://api.example.com"
+      GROK2API_STORE_BACKEND: "hybrid"
+      # High-concurrency: multi-worker (override in .env)
+      GROK2API_WORKERS: "${GROK2API_WORKERS:-4}"
+      REDIS_URL: "redis://redis:6379/0"
+      GROK2API_REDIS_URL: "redis://redis:6379/0"
+      DATABASE_URL: "postgresql://grok2api:grok2api@postgres:5432/grok2api"
+      GROK2API_DATABASE_URL: "postgresql://grok2api:grok2api@postgres:5432/grok2api"
+    healthcheck:
+      # $$ keeps substitution inside the container so override ports (e.g. 40081) work
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${GROK2API_PORT:-3000}/health >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 45s
     volumes:
       - ./data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    # Explicit aliases so external stacks (sub2api etc.) can resolve us after recreate
+    networks:
+      default:
+        aliases:
+          - grokcli-2api
     restart: unless-stopped
+
+volumes:
+  grok2api_pg:
+
+# Fixed project network name so other compose stacks can join as external:
+#   networks:
+#     grokcli-net:
+#       name: grokcli-2api_default
+#       external: true
+# Downstream DNS: http://grokcli-2api:<port>/v1
+networks:
+  default:
+    name: grokcli-2api_default
+    driver: bridge
+    labels:
+      com.grokcli-2api.network: "shared-upstream"

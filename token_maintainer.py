@@ -130,11 +130,14 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
                 from config import TOKEN_REFRESH_BATCH
             except Exception:
                 TOKEN_REFRESH_BATCH = 20
-            force_batch = min(TOKEN_REFRESH_BATCH * 2, 40) if force else TOKEN_REFRESH_BATCH
+            force_batch = min(TOKEN_REFRESH_BATCH * 2, 80) if force else TOKEN_REFRESH_BATCH
             refresh = refresh_all_accounts(
                 only_near_expiry=not force,
                 skew_seconds=skew if not force else 365 * 86400.0,
                 max_accounts=force_batch,
+                # Background / force batch: strict non-repeat sweep so permanent
+                # refresh failures cannot monopolize every cycle.
+                strict_sweep=True,
             )
             # Keep full result for the direct admin/API caller, but never retain
             # hundreds of per-account rows in the background status cache —
@@ -146,10 +149,23 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
                 if k != "results"
             }
             if isinstance(rows, list):
-                failed = [r for r in rows if not r.get("ok")]
+                failed = [r for r in rows if not r.get("ok") and not r.get("skipped")]
                 slim_refresh["failed_sample"] = failed[:5]
                 slim_refresh["failed"] = len(failed)
                 slim_refresh["skipped"] = sum(1 for r in rows if r.get("skipped"))
+                slim_refresh["invalidated"] = sum(
+                    1
+                    for r in rows
+                    if r.get("permanent")
+                    or r.get("deleted")
+                    or r.get("reason")
+                    in ("refresh_invalid", "refresh_invalid_deleted")
+                )
+                slim_refresh["deleted"] = int(
+                    (refresh or {}).get("deleted")
+                    or sum(1 for r in rows if r.get("deleted"))
+                    or 0
+                )
             result["refresh"] = slim_refresh
             accounts = list_accounts()
             result["accounts"] = []  # never embed full account list in status cache
@@ -159,6 +175,27 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
             result_full = dict(result)
             result_full["refresh"] = refresh
             result = result_full
+            # Operator-visible cycle log (kept short).
+            try:
+                sw = (refresh or {}).get("sweep") or {}
+                print(
+                    "  [token-maintainer] cycle: "
+                    f"refreshed={slim_refresh.get('refreshed')} "
+                    f"attempted={slim_refresh.get('attempted')} "
+                    f"failed={slim_refresh.get('failed')} "
+                    f"deferred={slim_refresh.get('deferred')} "
+                    f"deleted={slim_refresh.get('deleted') or slim_refresh.get('invalidated') or 0} "
+                    f"force={force}"
+                    + (
+                        f" sweep=gen:{sw.get('generation')} "
+                        f"covered={sw.get('covered')}/{sw.get('need_refresh')} "
+                        f"left={sw.get('remaining')}"
+                        if sw
+                        else ""
+                    )
+                )
+            except Exception:
+                pass
         except Exception as e:  # noqa: BLE001
             result["ok"] = False
             result["error"] = str(e)[:400]
@@ -170,15 +207,47 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
     }
     if isinstance(slim_last.get("refresh"), dict) and "results" in slim_last["refresh"]:
         rows = slim_last["refresh"].get("results") or []
+        sweep = slim_last["refresh"].get("sweep")
         slim_last["refresh"] = {
             k: v for k, v in slim_last["refresh"].items() if k != "results"
         }
-        slim_last["refresh"]["failed"] = sum(1 for r in rows if not r.get("ok"))
+        slim_last["refresh"]["failed"] = sum(
+            1 for r in rows if not r.get("ok") and not r.get("skipped")
+        )
         slim_last["refresh"]["skipped"] = sum(1 for r in rows if r.get("skipped"))
-        slim_last["refresh"]["failed_sample"] = [r for r in rows if not r.get("ok")][:5]
+        slim_last["refresh"]["failed_sample"] = [
+            r for r in rows if not r.get("ok") and not r.get("skipped")
+        ][:5]
+        if sweep:
+            slim_last["refresh"]["sweep"] = sweep
+    # Stamp completion time AFTER slim copy so Redis/UI always get `at`.
+    finished_at = time.time()
+    slim_last["at"] = finished_at
+    # Prefer the just-computed remaining; fall back if cycle errored early.
+    if slim_last.get("min_remaining_sec") is None:
+        try:
+            slim_last["min_remaining_sec"] = _min_remaining_seconds(force=True)
+        except Exception:
+            pass
+    try:
+        slim_last["next_wait_sec"] = _next_wait_seconds()
+    except Exception:
+        slim_last["next_wait_sec"] = _interval()
     _last_run.clear()
     _last_run.update(slim_last)
-    _last_run["at"] = time.time()
+    # Also mirror last run into Redis so non-leader workers can show real status.
+    try:
+        from store.redis_client import key, redis_enabled, set_ex
+        import json as _json
+
+        if redis_enabled() and slim_last:
+            set_ex(
+                key("token_maintainer", "last_run"),
+                _json.dumps(slim_last, ensure_ascii=False, default=str),
+                3600,
+            )
+    except Exception:
+        pass
     return result
 
 
@@ -196,6 +265,11 @@ def _worker() -> None:
     if _stop.wait(_startup_delay()):
         return
     while not _stop.is_set():
+        if not is_enabled():
+            # paused via admin toggle — idle until re-enabled / stop
+            _wakeup.clear()
+            _wakeup.wait(timeout=5.0)
+            continue
         run_once(force=False)
         wait = _next_wait_seconds()
         # Wait either for interval or an admin-triggered wakeup
@@ -212,9 +286,17 @@ def _worker() -> None:
             run_once(force=do_force)
 
 
+def is_enabled() -> bool:
+    try:
+        from settings_store import get_token_maintain_enabled
+        return bool(get_token_maintain_enabled())
+    except Exception:
+        return os.getenv("GROK2API_TOKEN_MAINTAIN", "1").lower() not in ("0", "false", "no")
+
+
 def start_background() -> None:
     global _thread
-    if os.getenv("GROK2API_TOKEN_MAINTAIN", "1").lower() in ("0", "false", "no"):
+    if not is_enabled():
         return
     if _thread and _thread.is_alive():
         return
@@ -224,40 +306,112 @@ def start_background() -> None:
 
 
 def stop_background() -> None:
+    global _thread
     _stop.set()
     _wakeup.set()
+    th = _thread
+    if th and th.is_alive():
+        th.join(timeout=2.0)
+    _thread = None
 
 
 def status(*, light: bool = False) -> dict[str, Any]:
-    rem = None if light else _min_remaining_seconds()
+    local_running = bool(_thread and _thread.is_alive())
     try:
         from config import TOKEN_REFRESH_BATCH, TOKEN_REFRESH_WORKERS
     except Exception:
         TOKEN_REFRESH_BATCH = 20
         TOKEN_REFRESH_WORKERS = 2
+    # Cluster-aware: only leader process has the thread. Non-leaders would
+    # otherwise always report running=false and confuse the admin UI.
+    cluster_running = local_running
+    leader_id = None
+    is_leader = False
+    try:
+        from store.leader import is_leader as _is_leader, status as _leader_status
+        is_leader = bool(_is_leader())
+        ls = _leader_status()
+        leader_id = ls.get("leader_id")
+        if is_enabled() and (local_running or (ls.get("is_leader") is False and leader_id)):
+            # If a leader id exists in this process view OR redis lock exists, treat as running when enabled.
+            cluster_running = True if is_enabled() else local_running
+        if not local_running and is_enabled():
+            try:
+                from store.redis_client import get_str, key, redis_enabled
+                if redis_enabled():
+                    lid = get_str(key("lock", "maintainer_leader"))
+                    if lid:
+                        leader_id = lid
+                        cluster_running = True
+            except Exception:
+                pass
+    except Exception:
+        pass
     out = {
-        "running": bool(_thread and _thread.is_alive()),
-        "enabled": os.getenv("GROK2API_TOKEN_MAINTAIN", "1").lower()
-        not in ("0", "false", "no"),
+        "running": bool(cluster_running),
+        "local_running": local_running,
+        "cluster_running": bool(cluster_running),
+        "leader_running": bool(cluster_running and is_enabled()),
+        "is_leader": is_leader,
+        "leader_id": leader_id,
+        "enabled": is_enabled(),
         "interval_sec": _interval(),
         "refresh_skew_sec": _skew(),
         "startup_delay_sec": _startup_delay(),
         "refresh_workers": TOKEN_REFRESH_WORKERS,
         "refresh_batch": TOKEN_REFRESH_BATCH,
     }
+    last = dict(_last_run) if _last_run else None
+    # Non-leader workers: read mirrored last_run from Redis.
+    if last is None:
+        try:
+            from store.redis_client import get_str, key, redis_enabled
+            import json as _json
+
+            if redis_enabled():
+                raw = get_str(key("token_maintainer", "last_run"))
+                if raw:
+                    last = _json.loads(raw)
+        except Exception:
+            last = None
+
+    # Always surface fields the admin UI needs — even in light mode.
+    # Prefer live local compute on the leader; fall back to last-run snapshot.
+    rem = None
+    next_wait = None
+    if local_running:
+        try:
+            rem = _min_remaining_seconds(force=not light)
+        except Exception:
+            rem = None
+        try:
+            next_wait = _next_wait_seconds()
+        except Exception:
+            next_wait = _interval()
+    if rem is None and isinstance(last, dict):
+        try:
+            rem = float(last.get("min_remaining_sec")) if last.get("min_remaining_sec") is not None else None
+        except (TypeError, ValueError):
+            rem = None
+    if next_wait is None and isinstance(last, dict) and last.get("next_wait_sec") is not None:
+        try:
+            next_wait = float(last.get("next_wait_sec"))
+        except (TypeError, ValueError):
+            next_wait = None
+    if next_wait is None:
+        next_wait = _interval()
+
+    out["min_remaining_sec"] = rem
+    out["next_wait_sec"] = next_wait
+
     if light:
         # Keep /health tiny: only last outcome summary, no per-account rows.
-        if _last_run:
-            out["last"] = {
-                "ok": _last_run.get("ok"),
-                "at": _last_run.get("at"),
-                "force": _last_run.get("force"),
-                "deferred_busy": _last_run.get("deferred_busy"),
-                "accounts_total": _last_run.get("accounts_total"),
-                "min_remaining_sec": _last_run.get("min_remaining_sec"),
-                "refresh": {
+        if last:
+            refresh = last.get("refresh")
+            if isinstance(refresh, dict):
+                refresh = {
                     k: v
-                    for k, v in ((_last_run.get("refresh") or {}).items())
+                    for k, v in refresh.items()
                     if k
                     in (
                         "ok",
@@ -267,15 +421,27 @@ def status(*, light: bool = False) -> dict[str, Any]:
                         "workers",
                         "failed",
                         "skipped",
+                        "invalidated",
+                        "deleted",
+                        "sweep",
                     )
                 }
-                if isinstance(_last_run.get("refresh"), dict)
-                else _last_run.get("refresh"),
+            out["last"] = {
+                "ok": last.get("ok"),
+                "at": last.get("at"),
+                "force": last.get("force"),
+                "deferred_busy": last.get("deferred_busy"),
+                "accounts_total": last.get("accounts_total"),
+                "min_remaining_sec": last.get("min_remaining_sec")
+                if last.get("min_remaining_sec") is not None
+                else rem,
+                "next_wait_sec": last.get("next_wait_sec")
+                if last.get("next_wait_sec") is not None
+                else next_wait,
+                "refresh": refresh,
             }
         else:
             out["last"] = None
     else:
-        out["next_wait_sec"] = _next_wait_seconds()
-        out["min_remaining_sec"] = rem
-        out["last"] = dict(_last_run) if _last_run else None
+        out["last"] = last
     return out
