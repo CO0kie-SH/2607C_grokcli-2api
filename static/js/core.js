@@ -6418,7 +6418,7 @@ async function loadUsageEvents({ reset = false } = {}) {
   const protocol = ($("usage-events-protocol") && $("usage-events-protocol").value) || "all";
   const ok = ($("usage-events-ok") && $("usage-events-ok").value) || "all";
   usageEventsPageSize = parseInt(($("usage-events-page-size") && $("usage-events-page-size").value) || "50", 10) || 50;
-  $("usage-events-tbody").innerHTML = `<tr><td colspan="13" class="g2a-muted">加载明细中…</td></tr>`;
+  $("usage-events-tbody").innerHTML = `<tr><td colspan="14" class="g2a-muted">加载明细中…</td></tr>`;
   if ($("usage-events-info")) $("usage-events-info").textContent = "查询中…";
   try {
     const params = new URLSearchParams({
@@ -6444,7 +6444,7 @@ async function loadUsageEvents({ reset = false } = {}) {
     }
     if (!items.length) {
       $("usage-events-tbody").innerHTML =
-        `<tr><td colspan="13" class="g2a-muted">暂无请求明细（新请求完成后会出现在这里）</td></tr>`;
+        `<tr><td colspan="14" class="g2a-muted">暂无请求明细（新请求完成后会出现在这里）</td></tr>`;
       return;
     }
     const fmtLatency = (ms) => {
@@ -6471,6 +6471,30 @@ async function loadUsageEvents({ reset = false } = {}) {
       if (hitPct != null) cacheParts.push(`命中 ${hitPct}%`);
       const cacheSub = cacheParts.join(" / ");
       const reasoningTokens = Number(it.reasoning_tokens || 0);
+      const effortRaw = (
+        it.reasoning_effort
+        || (it.detail && (it.detail.reasoning_effort || it.detail.thinking_intensity || it.detail.thinking_effort))
+        || ""
+      );
+      const effort = String(effortRaw || "").trim().toLowerCase();
+      const effortLabel = {
+        low: "低",
+        medium: "中",
+        high: "高",
+        xhigh: "极高",
+      }[effort] || (effort ? effort : "—");
+      let effortPill;
+      if (!effort) {
+        effortPill = '<span class="g2a-muted">—</span>';
+      } else if (effort === "low") {
+        effortPill = `<span class="g2a-tag" title="thinking intensity: ${esc(effort)}">${esc(effortLabel)}</span>`;
+      } else if (effort === "medium") {
+        effortPill = `<span class="g2a-tag warn" title="thinking intensity: ${esc(effort)}">${esc(effortLabel)}</span>`;
+      } else if (effort === "high" || effort === "xhigh") {
+        effortPill = `<span class="g2a-tag bad" title="thinking intensity: ${esc(effort)}">${esc(effortLabel)}</span>`;
+      } else {
+        effortPill = `<span class="g2a-tag" title="thinking intensity: ${esc(effort)}">${esc(effortLabel)}</span>`;
+      }
       const ttftMs = it.ttft_ms != null
         ? it.ttft_ms
         : (it.detail && it.detail.ttft_ms != null ? it.detail.ttft_ms : null);
@@ -6499,6 +6523,8 @@ async function loadUsageEvents({ reset = false } = {}) {
         cache_read_tokens: it.cache_read_tokens,
         cache_creation_tokens: it.cache_creation_tokens,
         reasoning_tokens: it.reasoning_tokens,
+        reasoning_effort: effort || "",
+        thinking_intensity: effort || "",
         client_ip: it.client_ip,
         user_agent: it.user_agent,
         status_code: it.status_code,
@@ -6519,6 +6545,7 @@ async function loadUsageEvents({ reset = false } = {}) {
         <td class="mono">${fmtNum(it.total_tokens)}</td>
         <td class="mono" style="font-size:12px">${cacheTokens > 0 ? fmtNum(cacheTokens) : "—"}${cacheSub ? `<div class="g2a-muted" style="font-size:11px">${esc(cacheSub)}</div>` : ""}</td>
         <td class="mono">${reasoningTokens > 0 ? fmtNum(reasoningTokens) : "—"}</td>
+        <td style="font-size:12px;text-align:center">${effortPill}</td>
         <td class="mono" style="font-size:12px" title="首字延迟 TTFT">${esc(fmtLatency(ttftMs))}</td>
         <td class="mono" style="font-size:12px" title="请求完成总耗时">${esc(fmtLatency(doneMs))}</td>
         <td>${okPill}</td>
@@ -6528,7 +6555,7 @@ async function loadUsageEvents({ reset = false } = {}) {
     if (seq !== usageEventsLoadSeq) return;
     console.warn("loadUsageEvents", e);
     $("usage-events-tbody").innerHTML =
-      `<tr><td colspan="13" class="g2a-muted">加载失败：${esc((e && e.message) || e)}</td></tr>`;
+      `<tr><td colspan="14" class="g2a-muted">加载失败：${esc((e && e.message) || e)}</td></tr>`;
     if ($("usage-events-info")) $("usage-events-info").textContent = "加载失败";
     toast((e && e.message) || "加载使用明细失败", false);
   } finally {

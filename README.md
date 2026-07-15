@@ -2,14 +2,14 @@
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / SSO / JSON 导入导出、协议注册。
 
-**当前版本：v1.9.87** · Token 过期移出轮询 · 连续续期失败 SSO 自愈 · 首页按账号状态统计
+**当前版本：v1.9.88** · 使用明细展示思考强度 · Token 过期移出轮询 · SSO 续期自愈
 
 [![GHCR](https://img.shields.io/badge/ghcr.io-hm2899%2Fgrokcli--2api-blue)](https://github.com/users/HM2899/packages/container/package/grokcli-2api)
 [![Release](https://img.shields.io/github/v/release/HM2899/grokcli-2api?display_name=tag)](https://github.com/HM2899/grokcli-2api/releases)
 
 | 镜像（全小写） | 说明 |
 |----------------|------|
-| `ghcr.io/hm2899/grokcli-2api:1.9.87` | 当前版本 |
+| `ghcr.io/hm2899/grokcli-2api:1.9.88` | 当前版本 |
 | `ghcr.io/hm2899/grokcli-2api:latest` | 最近 `v*` tag |
 | `ghcr.io/hm2899/grokcli-2api:edge` | `main` 最新 |
 
@@ -19,7 +19,7 @@
 - **会话粘性 / Prompt Cache**：`prompt_cache_key` / Claude session / messages hash；model 隔离绑定；TTL 可热改
 - **协议注册**：内置 `grok-build-auth`（纯 HTTP，无需 Chromium）；**SSO 入库**；可选 **注册成功后自动推 sub2api**
 - **中继友好**：兼容 new-api / sub2api / Claude Code / Codex；`Update`/`StrReplace` → `Edit`；**后到完整参数覆盖错误路径**
-- **秒开流 + 可观测**：early SSE 信封；用量明细含 `ttft_ms` / `latency_ms`；任务日志 + 终态帧
+- **秒开流 + 可观测**：early SSE 信封；用量明细含 `ttft_ms` / `latency_ms` / **思考强度**；任务日志 + 终态帧
 
 ---
 
@@ -62,35 +62,23 @@
 | 协议注册 | MoeMail / YYDS / GPTMail / CF Temp Email + 内联过盾 / YesCaptcha；代理池；入池后延迟测活 |
 | SSO / JSON | 后台任务 + 实时进度；JSON 多文件导入 / 选中导出；**一键推送 sub2api（账号容量/优先级/倍率）** |
 | 任务日志 | 注册、SSO、JSON、测活、续期等结果落 PG |
-| 用量统计 | 代理侧 token / 请求：今日·近 N 天·累计；按 Key / 账号 / 模型；**首字 TTFT / 完成耗时** |
+| 用量统计 | 代理侧 token / 请求：今日·近 N 天·累计；按 Key / 账号 / 模型；**首字 TTFT / 完成耗时 / 思考强度** |
 | 流式可靠性 | early SSE 信封；**假阳性 client_gone 不再丢中间 tool/text 帧**；错误/断开仍发终态帧 |
 | 容器时区 | 默认 `TZ=Asia/Shanghai`（日志与本地时间） |
 
 ---
 
-## 本版本重点（v1.9.87）
+## 本版本重点（v1.9.88）
 
 | 能力 | 行为 |
 |------|------|
-| **过期移出轮询** | access token 过期 / 续期失败 → 立刻 `pool_status=expired`，**不再进入请求轮询**；凭证保留 |
-| **连续 2 次续期失败** | 仍有 RT 但 RT 坏了：第 1 次只软过期；第 2 次 → **有 SSO 则尝试 SSO 重转**，成功回池 |
-| **无 SSO 移出号池** | 连续 2 次续期失败且无可用 SSO → `enabled=false` + `pool_status=expired`，移出号池（不删凭证） |
-| **续期成功回池** | 清过期/失败计数；若此前被无 SSO 踢出，自动 `enabled=true` 回到轮询（额度禁用除外） |
-| **首页状态统计** | 冷却 / 过期 / 禁用 / 轮询中 **直接数库里账号状态字段**（`pool_status` 等），不再用墙钟二次推算 |
-| **管理台** | 账号列表显示红色「过期」标签；概览展示过期数量 |
+| **使用明细 · 思考强度** | 管理台「使用明细」新增「思考强度」列：低 / 中 / 高 / 极高 |
+| **协议覆盖** | OpenAI `reasoning_effort` · Anthropic `thinking` / `budget_tokens` · Responses `reasoning.effort` |
+| **落库** | 写入 usage event `detail.reasoning_effort`（兼容 `thinking_intensity`）；列表接口透出 |
+| **预算映射** | Anthropic `budget_tokens` 与上游一致：≤4k low · ≤16k medium · ≤48k high · 更大 xhigh |
+| **详情** | 点击行可在完整明细中看到 `reasoning_effort` / `thinking_intensity` |
 
-继承 v1.9.86：没额度直接冷却踢出 · 轮询负载分散 · 冷却池硬排除 · CPA 会话粘性。
-
-本地回归：
-
-```bash
-python3 scripts/_test_free_usage_hard_kick.py
-python3 scripts/_test_strict_cooldown_rotation.py
-python3 scripts/_test_rotation_load_spread.py
-python3 scripts/_test_cpa_affinity_improvements.py
-```
-
-详情见 [`scripts/README.md`](scripts/README.md)。
+继承 v1.9.87：Token 过期移出轮询 · 连续续期失败 SSO 自愈 · 首页按账号状态统计。
 
 ---
 
@@ -174,7 +162,7 @@ ghcr.io/hm2899/grokcli-2api
 **正确示例：**
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:1.9.87
+docker pull ghcr.io/hm2899/grokcli-2api:1.9.88
 # 或
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
@@ -213,7 +201,7 @@ services:
       retries: 10
 
   grokcli-2api:
-    image: ghcr.io/hm2899/grokcli-2api:1.9.87
+    image: ghcr.io/hm2899/grokcli-2api:1.9.88
     ports:
       # 只映射应用；不要给 postgres/redis 加 ports
       - "3000:3000"
@@ -462,15 +450,15 @@ docker exec grokcli-2api sh -c 'echo TZ=$TZ; date'
 ```bash
 # 1) app.py 中 APP_VERSION 必须与 git tag 一致（镜像路径全小写）
 # 2) 推 main → edge + 版本号；推 v* tag → 额外 latest + GitHub Release
-git add -A && git commit -m "release: v1.9.87"
+git add -A && git commit -m "release: v1.9.88"
 git push origin main
-git tag -a v1.9.87 -m "v1.9.87"
-git push origin v1.9.87
-gh release create v1.9.87 --title "v1.9.87 Token 过期移出轮询 · SSO 续期自愈" --notes-file - <<'EOF'
+git tag -a v1.9.88 -m "v1.9.88"
+git push origin v1.9.88
+gh release create v1.9.88 --title "v1.9.88 使用明细思考强度" --notes-file - <<'EOF'
 ## Highlights
-- Token 过期立刻标记 expired 并移出请求轮询
-- 连续两次续期失败：有 SSO 则重转，无 SSO 则移出号池
-- 首页冷却/过期/禁用统计直接按库内账号状态字段计数
+- 使用明细新增思考强度列（低/中/高/极高）
+- 记录 OpenAI / Anthropic / Responses 请求的 reasoning_effort
+- 兼容 budget_tokens → effort 映射
 EOF
 # 监视构建
 gh run list --workflow=docker-publish.yml --limit 3
@@ -479,7 +467,7 @@ gh run list --workflow=docker-publish.yml --limit 3
 成功后拉取（**必须小写**）：
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:1.9.87
+docker pull ghcr.io/hm2899/grokcli-2api:1.9.88
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
 
@@ -537,7 +525,12 @@ turnstile-solver/                        # 本地过盾（内联）
 
 ## 版本
 
-- **v1.9.87**（当前）
+- **v1.9.88**（当前）
+  - **使用明细 · 思考强度**：管理台「使用明细」展示 low/medium/high/xhigh（低/中/高/极高）
+  - 从 OpenAI `reasoning_effort`、Anthropic `thinking`/`budget_tokens`、Responses `reasoning.effort` 提取并写入 usage detail
+  - 列表接口透出 `reasoning_effort`；点击行可看完整字段
+  - 继承 v1.9.87：Token 过期移出轮询 · SSO 续期自愈 · 首页状态统计
+- **v1.9.87**
   - **Token 过期移出轮询**：access token 过期 / 续期失败立刻 `pool_status=expired`，请求轮询硬排除；凭证保留
   - **连续 2 次 RT 续期失败**：第 1 次仅软过期；第 2 次有 SSO 则 `sso_to_auth_json` 重转回池；无 SSO 则移出号池
   - **续期成功回池**：清失败计数；此前因无 SSO 被踢也会自动 re-enable

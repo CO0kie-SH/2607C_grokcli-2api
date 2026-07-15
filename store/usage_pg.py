@@ -762,6 +762,12 @@ def list_events(
                 "ttft_ms": ttft_val,
                 "error": r[20],
                 "detail": detail if isinstance(detail, dict) else {},
+                "reasoning_effort": (
+                    (detail.get("reasoning_effort") if isinstance(detail, dict) else None)
+                    or (detail.get("thinking_intensity") if isinstance(detail, dict) else None)
+                    or (detail.get("thinking_effort") if isinstance(detail, dict) else None)
+                    or ""
+                ),
             }
         )
     return {

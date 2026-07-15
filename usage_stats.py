@@ -682,6 +682,15 @@ def list_events(
                 meta = by_id.get(it.get("api_key_id")) or {}
                 it["api_key_name"] = meta.get("name") or ""
                 it["api_key_prefix"] = meta.get("prefix") or ""
+                # Surface thinking intensity even if older rows only stored it in detail.
+                if not it.get("reasoning_effort"):
+                    d = it.get("detail") if isinstance(it.get("detail"), dict) else {}
+                    it["reasoning_effort"] = (
+                        d.get("reasoning_effort")
+                        or d.get("thinking_intensity")
+                        or d.get("thinking_effort")
+                        or ""
+                    )
         except Exception:
             pass
         try:

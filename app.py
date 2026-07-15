@@ -55,7 +55,7 @@ import config as _config
 import history_compact
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.9.87"
+APP_VERSION = "1.9.88"
 
 # Per-request usage context (client IP / path / UA) for request-level ledger rows.
 _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -2074,6 +2074,161 @@ def _usage_from_body_and_output(
     )
 
 
+def _normalize_reasoning_effort(value: Any) -> str | None:
+    """Normalize client thinking / reasoning intensity to a short label.
+
+    Labels: low / medium / high / xhigh. Budget thresholds match
+    anthropic_compat._anthropic_thinking_to_reasoning_effort so OpenAI and
+    Anthropic clients land on the same band for the same budget_tokens.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        # true alone usually means "turn thinking on" without a level.
+        return "medium" if value else None
+    if isinstance(value, (int, float)):
+        # budget_tokens style → map to effort bands (same cutoffs as anthropic_compat)
+        try:
+            n = int(value)
+        except Exception:
+            return None
+        if n <= 0:
+            return None
+        if n <= 4096:
+            return "low"
+        if n <= 16000:
+            return "medium"
+        if n <= 48000:
+            return "high"
+        return "xhigh"
+    if isinstance(value, dict):
+        # Prefer explicit effort-like fields first. Do NOT walk ``type`` here —
+        # Anthropic uses type=enabled/adaptive with budget_tokens, and treating
+        # "enabled" as high would hide the real budget band.
+        for key in (
+            "effort",
+            "reasoning_effort",
+            "thinking_effort",
+            "intensity",
+            "level",
+        ):
+            if key in value and value.get(key) is not None:
+                got = _normalize_reasoning_effort(value.get(key))
+                if got:
+                    return got
+        if value.get("budget_tokens") is not None:
+            return _normalize_reasoning_effort(value.get("budget_tokens"))
+        ttype = str(value.get("type") or "").lower()
+        if value.get("enabled") is True or ttype in {"enabled", "adaptive"}:
+            # enabled / adaptive without budget or effort → medium default
+            # (matches anthropic_compat when budget is missing).
+            return "medium"
+        return None
+    s = str(value).strip().lower()
+    if not s or s in {"none", "null", "false", "off", "disabled"}:
+        return None
+    aliases = {
+        "minimal": "low",
+        "min": "low",
+        "l": "low",
+        "m": "medium",
+        "med": "medium",
+        "h": "high",
+        "max": "xhigh",
+        "maximum": "xhigh",
+        "ultra": "xhigh",
+        "extra_high": "xhigh",
+        "extrahigh": "xhigh",
+        "enabled": "medium",
+        "adaptive": "medium",
+        "true": "medium",
+        "on": "medium",
+    }
+    s = aliases.get(s, s)
+    if s in {"low", "medium", "high", "xhigh"}:
+        return s
+    return s[:32] if s else None
+
+
+def _extract_reasoning_effort_from_payload(payload: Any) -> str | None:
+    """Best-effort extract thinking intensity from OpenAI / Anthropic / Responses body."""
+    if payload is None:
+        return None
+    # pydantic model
+    if hasattr(payload, "model_dump"):
+        try:
+            payload = payload.model_dump(exclude_none=False)
+        except Exception:
+            try:
+                payload = dict(payload)
+            except Exception:
+                pass
+    elif hasattr(payload, "__dict__") and not isinstance(payload, dict):
+        try:
+            payload = {
+                k: getattr(payload, k)
+                for k in (
+                    "reasoning_effort",
+                    "reasoning",
+                    "thinking",
+                    "effort",
+                )
+                if hasattr(payload, k)
+            }
+        except Exception:
+            pass
+    if not isinstance(payload, dict):
+        return _normalize_reasoning_effort(payload)
+
+    for key in (
+        "reasoning_effort",
+        "thinking_effort",
+        "effort",
+        "thinking_intensity",
+    ):
+        if payload.get(key) is not None:
+            got = _normalize_reasoning_effort(payload.get(key))
+            if got:
+                return got
+
+    reasoning = payload.get("reasoning")
+    got = _normalize_reasoning_effort(reasoning)
+    if got:
+        return got
+
+    thinking = payload.get("thinking")
+    if thinking is not None:
+        try:
+            import anthropic_compat as anth
+
+            # Private helper is the single source of truth for Anthropic budgets.
+            mapper = getattr(anth, "_anthropic_thinking_to_reasoning_effort", None)
+            if mapper is None:
+                mapper = getattr(anth, "thinking_to_reasoning_effort", None)
+            mapped = mapper(thinking) if callable(mapper) else None
+            got = _normalize_reasoning_effort(mapped if mapped is not None else thinking)
+            if got:
+                return got
+        except Exception:
+            got = _normalize_reasoning_effort(thinking)
+            if got:
+                return got
+    return None
+
+
+def _stamp_usage_reasoning_effort(effort: Any) -> None:
+    """Merge reasoning_effort into the current request usage context."""
+    label = _normalize_reasoning_effort(effort)
+    if not label:
+        return
+    try:
+        cur = dict(_usage_request_ctx.get() or {})
+        cur["reasoning_effort"] = label
+        _usage_request_ctx.set(cur)
+    except Exception:
+        pass
+
+
 def _capture_usage_request_ctx(request: Request | None = None) -> dict[str, Any]:
     """Snapshot request meta for usage events (safe to pass into stream tasks)."""
     ctx = dict(_usage_request_ctx.get() or {})
@@ -2476,6 +2631,20 @@ def _record_usage_safe(
             detail_out["ttft_ms"] = int(ttft_out)
         if latency_out is not None and "latency_ms" not in detail_out:
             detail_out["latency_ms"] = int(latency_out)
+        # Thinking / reasoning intensity for admin 使用明细.
+        try:
+            effort = (
+                detail_out.get("reasoning_effort")
+                or detail_out.get("thinking_effort")
+                or detail_out.get("thinking_intensity")
+                or (ctx or {}).get("reasoning_effort")
+            )
+            effort = _normalize_reasoning_effort(effort)
+            if effort:
+                detail_out["reasoning_effort"] = effort
+                detail_out.setdefault("thinking_intensity", effort)
+        except Exception:
+            pass
         if not ok:
             if err_out is None or not str(err_out).strip():
                 # Prefer an explicit detail.message over the opaque default.
@@ -3998,6 +4167,13 @@ async def chat_completions(
     timing = RequestTiming(protocol="openai", stream=bool(req.stream))
     model = resolve_model(req.model)
     timing.model = model
+    try:
+        _stamp_usage_reasoning_effort(
+            getattr(req, "reasoning_effort", None)
+            or _extract_reasoning_effort_from_payload(req)
+        )
+    except Exception:
+        pass
     conv_fp, prefer_account, pck, pck_minted = await asyncio.to_thread(
         _resolve_conversation_affinity,
         req,
@@ -5403,6 +5579,14 @@ async def anthropic_messages(
     timing = RequestTiming(protocol="anthropic", stream=bool(req.stream))
     model = resolve_model(req.model)
     timing.model = model
+    try:
+        # Anthropic clients send thinking / budget_tokens; map to effort label.
+        _stamp_usage_reasoning_effort(
+            _extract_reasoning_effort_from_payload(req)
+            or getattr(req, "thinking", None)
+        )
+    except Exception:
+        pass
     conv_fp, prefer_account, pck, pck_minted = await asyncio.to_thread(
         _resolve_anthropic_affinity,
         req,
@@ -5847,6 +6031,12 @@ async def openai_responses(
         stream=want_stream,
         req_id=response_id.replace("resp_", "")[:12],
     )
+    try:
+        _stamp_usage_reasoning_effort(
+            _extract_reasoning_effort_from_payload(req_body)
+        )
+    except Exception:
+        pass
 
     body = oai_resp.responses_request_to_chat_body(req_body, model=model)
     if not body.get("messages"):
